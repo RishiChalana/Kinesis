@@ -5,9 +5,20 @@ Phase 2 in-memory stores are replaced with real DB writes. Auth endpoints
 user_id from the token, never from the request body.
 """
 
+import asyncio
+import json
+import time
 from datetime import datetime
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import select
@@ -19,8 +30,13 @@ from backend.auth import (
     hash_password,
     verify_password,
 )
+from backend.connection_manager import ConnectionManager
 from backend.database import get_db
 from backend.models import User, Workout
+
+# Heartbeat timing (seconds).
+HEARTBEAT_IDLE_SECONDS = 10.0
+HEARTBEAT_PONG_TIMEOUT_SECONDS = 5.0
 
 app = FastAPI(title="KINESIS")
 
@@ -165,3 +181,64 @@ def list_sessions(
         stmt = stmt.where(Workout.exercise == exercise)
     stmt = stmt.order_by(Workout.started_at.desc()).limit(limit)
     return list(db.scalars(stmt).all())
+
+
+# --------------------------------------------------------------------------- #
+# WebSocket — live pose stream (see docs/websocket_schema.md)
+# --------------------------------------------------------------------------- #
+manager = ConnectionManager()
+
+
+def build_frame_message(data: dict) -> dict:
+    """Build an outgoing frame message per the schema. Phase-5/6 fields are
+    placeholders (null/empty) for now; the CV client supplies frame_id, state,
+    rep_count and angles."""
+    return {
+        "frame_id": data.get("frame_id"),
+        "timestamp": data.get("timestamp", time.time()),
+        "rep_count": data.get("rep_count", 0),
+        "state": data.get("state", "UP"),
+        "form_score": None,
+        "active_errors": [],
+        "left_angle": data.get("left_angle"),
+        "right_angle": data.get("right_angle"),
+        "asymmetry_pct": None,
+        "tempo_phase": None,
+        "tempo_seconds": None,
+    }
+
+
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    await manager.connect(websocket, session_id)
+    try:
+        while True:
+            try:
+                message = await asyncio.wait_for(
+                    websocket.receive_text(), timeout=HEARTBEAT_IDLE_SECONDS
+                )
+            except asyncio.TimeoutError:
+                # Idle for 10s: ping and require a pong within 5s, else drop.
+                await websocket.send_text(json.dumps({"type": "ping"}))
+                try:
+                    message = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=HEARTBEAT_PONG_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    await websocket.close(code=status.WS_1001_GOING_AWAY)
+                    manager.disconnect(session_id)
+                    return
+
+            try:
+                data = json.loads(message) if message else {}
+            except json.JSONDecodeError:
+                data = {}
+
+            # Heartbeat replies keep the connection alive; nothing to echo.
+            if data.get("type") == "pong":
+                continue
+
+            await websocket.send_text(json.dumps(build_frame_message(data)))
+    except WebSocketDisconnect:
+        manager.disconnect(session_id)

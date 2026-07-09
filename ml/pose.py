@@ -19,16 +19,34 @@ KEY LANDMARK IDs (MediaPipe Pose, 33 total) — memorise these:
 ------------------------------------------------------------------------------
 """
 
+import os
+import sys
 import time
+
+# Allow `python ml/pose.py` (script dir on path) to still import the ml package.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import cv2
 import mediapipe as mp
+
+from ml.angles import calculate_angle
+from ml.rep_counter import RepCounter
 
 mp_pose = mp.solutions.pose
 mp_draw = mp.solutions.drawing_utils
 
 # Visibility below this is unreliable — gate every landmark use on it.
 VISIBILITY_THRESHOLD = 0.5
+
+# Primary angle per exercise as a (point_a, vertex_b, point_c) triple of
+# MediaPipe landmark IDs. The vertex is the monitored joint. Left side is used.
+POSE_ANGLE_LANDMARKS = {
+    "squat": (23, 25, 27),       # hip -> knee -> ankle  (knee angle)
+    "deadlift": (11, 23, 25),    # shoulder -> hip -> knee (hip angle)
+    "bicep_curl": (11, 13, 15),  # shoulder -> elbow -> wrist (elbow angle)
+    "pushup": (11, 13, 15),      # shoulder -> elbow -> wrist (elbow angle)
+    "lunge": (23, 25, 27),       # hip -> front knee -> ankle (knee angle)
+}
 
 
 def extract_landmarks(results, frame_w, frame_h):
@@ -60,7 +78,31 @@ def extract_landmarks(results, frame_w, frame_h):
     return landmarks
 
 
+def _angle_for_exercise(landmarks, exercise):
+    """Compute the monitored joint angle for `exercise` from the canonical
+    landmark list. Returns None if the required landmarks are missing or not
+    confidently visible (all three must clear the visibility gate)."""
+    triple = POSE_ANGLE_LANDMARKS[exercise]
+    pts = []
+    for idx in triple:
+        if idx >= len(landmarks):
+            return None
+        lm = landmarks[idx]
+        if lm["visibility"] <= VISIBILITY_THRESHOLD:
+            return None
+        pts.append({"x": lm["x_px"], "y": lm["y_px"]})
+    return calculate_angle(pts[0], pts[1], pts[2])
+
+
 def main():
+    # Exercise selected via CLI, e.g. `python ml/pose.py squat`. Default: squat.
+    exercise = sys.argv[1] if len(sys.argv) > 1 else "squat"
+    if exercise not in POSE_ANGLE_LANDMARKS:
+        print(f"Unknown exercise '{exercise}'. Choose from "
+              f"{sorted(POSE_ANGLE_LANDMARKS)}.")
+        return
+    counter = RepCounter.for_exercise(exercise)
+
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("ERROR: could not open webcam (VideoCapture(0)).")
@@ -68,6 +110,7 @@ def main():
 
     prev_time = time.time()
     shape_printed = False
+    frame_num = 0
 
     # model_complexity=1 is the balanced option (0 fastest/less accurate,
     # 2 most accurate/slow). Detection/tracking confidences per Phase 3 spec.
@@ -113,28 +156,35 @@ def main():
                     mp_draw.DrawingSpec(color=(255, 255, 255), thickness=2),
                 )
 
-            # Example downstream use: only trust landmarks above the gate.
-            visible = sum(
-                1 for lm in landmarks if lm["visibility"] > VISIBILITY_THRESHOLD
-            )
+            # Compute the monitored joint angle and feed the rep counter.
+            angle = _angle_for_exercise(landmarks, exercise)
+            if angle is not None:
+                counter.update(angle, frame_num)
 
             current_time = time.time()
             elapsed = current_time - prev_time
             fps = 1.0 / elapsed if elapsed > 0 else 0.0
             prev_time = current_time
 
+            # HUD: FPS, exercise + live angle, rep count and state.
             cv2.putText(
-                frame,
-                f"FPS: {fps:.1f}  landmarks visible: {visible}/33",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
+                frame, f"FPS: {fps:.1f}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
+            )
+            angle_text = f"{exercise} angle: {angle:.0f}" if angle is not None \
+                else f"{exercise} angle: --"
+            cv2.putText(
+                frame, angle_text, (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
+            )
+            cv2.putText(
+                frame, f"REPS: {counter.count}  ({counter.state})", (10, 95),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2,
             )
 
             cv2.imshow("KINESIS pose", frame)
 
+            frame_num += 1
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
