@@ -1,17 +1,26 @@
-"""TRACK B — FastAPI foundations (Phase 2).
+"""KINESIS backend API (Phase 3).
 
-A multi-endpoint API demonstrating path params, query params, and Pydantic
-request/response models. Data is kept in simple in-memory stores so the
-endpoints are testable in Swagger UI without wiring the database yet
-(DB persistence arrives in later phases via the SQLAlchemy models + Alembic).
+Phase 2 in-memory stores are replaced with real DB writes. Auth endpoints
+(register/login) issue JWTs; workout endpoints are protected and derive the
+user_id from the token, never from the request body.
 """
 
-from datetime import datetime, timezone
-from itertools import count
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from backend.auth import (
+    create_access_token,
+    get_current_user,
+    hash_password,
+    verify_password,
+)
+from backend.database import get_db
+from backend.models import User, Workout
 
 app = FastAPI(title="KINESIS")
 
@@ -34,10 +43,22 @@ class UserCreate(BaseModel):
 
 
 class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     name: str
     email: EmailStr
     created_at: datetime
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
 
 
 class SessionStart(BaseModel):
@@ -47,32 +68,17 @@ class SessionStart(BaseModel):
 
 
 class SessionResponse(BaseModel):
-    session_id: int
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
     exercise: str
-    target_sets: int
-    reps_per_set: int
     started_at: datetime
-    status: str
-
-
-class RepRecord(BaseModel):
-    set_num: int
-    rep_num: int
-    form_score: float
-    duration_seconds: float
+    ended_at: datetime | None = None
 
 
 # --------------------------------------------------------------------------- #
-# In-memory stores (placeholder persistence for Phase 2)
-# --------------------------------------------------------------------------- #
-_users: dict[int, UserResponse] = {}
-_sessions: dict[int, SessionResponse] = {}
-_user_ids = count(1)
-_session_ids = count(1)
-
-
-# --------------------------------------------------------------------------- #
-# Endpoints
+# Health
 # --------------------------------------------------------------------------- #
 @app.get("/")
 def root():
@@ -84,56 +90,78 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/users", response_model=UserResponse, status_code=201)
-def create_user(payload: UserCreate) -> UserResponse:
-    if any(u.email == payload.email for u in _users.values()):
+# --------------------------------------------------------------------------- #
+# Auth
+# --------------------------------------------------------------------------- #
+@app.post("/auth/register", response_model=UserResponse, status_code=201)
+def register(payload: UserCreate, db: Session = Depends(get_db)) -> User:
+    existing = db.scalar(select(User).where(User.email == payload.email))
+    if existing is not None:
         raise HTTPException(status_code=409, detail="Email already registered")
-    user = UserResponse(
-        id=next(_user_ids),
+    user = User(
         name=payload.name,
         email=payload.email,
-        created_at=datetime.now(timezone.utc),
+        hashed_password=hash_password(payload.password),
     )
-    _users[user.id] = user
+    db.add(user)
+    db.commit()
+    db.refresh(user)
     return user
 
 
+@app.post("/auth/login", response_model=TokenResponse)
+def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
+    user = db.scalar(select(User).where(User.email == payload.email))
+    if user is None or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return TokenResponse(access_token=create_access_token(user.id))
+
+
+# --------------------------------------------------------------------------- #
+# Users
+# --------------------------------------------------------------------------- #
+@app.get("/users/me", response_model=UserResponse)
+def read_me(current_user: User = Depends(get_current_user)) -> User:
+    return current_user
+
+
 @app.get("/users/{user_id}", response_model=UserResponse)
-def get_user(user_id: int) -> UserResponse:
-    user = _users.get(user_id)
+def get_user(user_id: int, db: Session = Depends(get_db)) -> User:
+    user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
 
+# --------------------------------------------------------------------------- #
+# Sessions (protected — user_id comes from the token, not the body)
+# --------------------------------------------------------------------------- #
 @app.post("/sessions/start", response_model=SessionResponse, status_code=201)
-def start_session(payload: SessionStart) -> SessionResponse:
-    session = SessionResponse(
-        session_id=next(_session_ids),
-        exercise=payload.exercise,
-        target_sets=payload.target_sets,
-        reps_per_set=payload.reps_per_set,
-        started_at=datetime.now(timezone.utc),
-        status="active",
-    )
-    _sessions[session.session_id] = session
-    return session
-
-
-@app.get("/sessions/{session_id}", response_model=SessionResponse)
-def get_session(session_id: int) -> SessionResponse:
-    session = _sessions.get(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return session
+def start_session(
+    payload: SessionStart,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Workout:
+    workout = Workout(user_id=current_user.id, exercise=payload.exercise)
+    db.add(workout)
+    db.commit()
+    db.refresh(workout)
+    return workout
 
 
 @app.get("/sessions", response_model=list[SessionResponse])
 def list_sessions(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
     exercise: str | None = Query(default=None, description="Filter by exercise"),
     limit: int = Query(default=10, gt=0, le=100),
-) -> list[SessionResponse]:
-    results = list(_sessions.values())
+) -> list[Workout]:
+    stmt = select(Workout).where(Workout.user_id == current_user.id)
     if exercise is not None:
-        results = [s for s in results if s.exercise == exercise]
-    return results[:limit]
+        stmt = stmt.where(Workout.exercise == exercise)
+    stmt = stmt.order_by(Workout.started_at.desc()).limit(limit)
+    return list(db.scalars(stmt).all())

@@ -7,8 +7,9 @@ alembic
 python-dotenv
 python-jose[cryptography]
 passlib[bcrypt]
+bcrypt==4.0.1
 opencv-python
-mediapipe
+mediapipe==0.10.14
 numpy
 scipy
 fastdtw
