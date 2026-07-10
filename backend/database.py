@@ -1,6 +1,7 @@
 """Database engine, session factory, and the get_db dependency (Phase 3)."""
 
 import os
+import warnings
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
@@ -10,7 +11,11 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set. Add it to the project-root .env")
+    # Fall back to a localhost placeholder so the app can still import (e.g.
+    # `docker run` just to view /docs, or CI import checks). The engine is lazy,
+    # so this only matters if a DB-backed endpoint is actually called.
+    warnings.warn("DATABASE_URL not set — using a localhost placeholder.")
+    DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/kinesis"
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

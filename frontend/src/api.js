@@ -1,6 +1,7 @@
 // Minimal API client with token auth stored in localStorage.
 
-const API = "http://localhost:8000";
+// Configurable for deployment (Vercel/Docker); defaults to local dev.
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 export const getToken = () => localStorage.getItem("kinesis_token");
 export const getUserId = () => localStorage.getItem("kinesis_uid");

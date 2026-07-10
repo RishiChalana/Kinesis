@@ -1,0 +1,62 @@
+# KINESIS full stack: TimescaleDB + FastAPI backend + nginx-served React.
+# Start everything from zero with:  docker-compose up --build
+#
+# The db service is NOT published to the host (no ports:) so it won't clash with
+# a TimescaleDB you already run on localhost:5432. The backend reaches it over
+# the internal network at host `db`.
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg18
+    environment:
+      POSTGRES_DB: kinesis
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: kinesis
+    volumes:
+      # pg18 changed the layout: mount the volume at /var/lib/postgresql (the
+      # image creates a `data` subdir). The plan's /var/lib/postgresql/data is
+      # the old pg15 convention and makes pg18 refuse to start.
+      - postgres_data:/var/lib/postgresql
+    networks:
+      - kinesis
+
+  backend:
+    # amd64 to match the deploy target + the available ML wheels (see Dockerfile).
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    # Override the image default (uvicorn only) to run migrations first.
+    command: ["sh", "backend/docker-entrypoint.sh"]
+    env_file:
+      - .env
+    environment:
+      # Point at the compose db service; overrides DATABASE_URL from .env.
+      DATABASE_URL: postgresql://postgres:kinesis@db:5432/kinesis
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    networks:
+      - kinesis
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Browser talks to the backend published on the host at :8000.
+        VITE_API_URL: http://localhost:8000
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - kinesis
+
+volumes:
+  postgres_data:
+
+networks:
+  kinesis:
+    driver: bridge

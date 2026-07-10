@@ -5,7 +5,9 @@ import { getToken } from "./api";
 import { drawSkeleton } from "./skeleton";
 import "./WorkoutView.css";
 
-const WS_HOST = "ws://localhost:8000";
+// Derive the WS origin from the configurable API URL (http -> ws, https -> wss).
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const WS_HOST = API_URL.replace(/^http/, "ws");
 const SEND_INTERVAL_MS = 66; // ~15 fps upstream
 const ALERT_TTL_MS = 3000;
 
