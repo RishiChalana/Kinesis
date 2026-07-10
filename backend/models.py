@@ -50,6 +50,13 @@ class UserProfile(Base):
     shoulder_width_px: Mapped[float | None] = mapped_column(Float)
     calibrated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # Phase 5 calibration fields (PersonalProfile).
+    torso_femur_ratio: Mapped[float | None] = mapped_column(Float)
+    hip_width_px: Mapped[float | None] = mapped_column(Float)
+    squat_depth_threshold: Mapped[float | None] = mapped_column(Float)
+    squat_lean_threshold: Mapped[float | None] = mapped_column(Float)
+    natural_hinge_angle: Mapped[float | None] = mapped_column(Float)
+
     user: Mapped[User] = relationship(back_populates="profiles")
 
 
@@ -63,6 +70,10 @@ class Workout(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Phase 5 session summary, filled in on PATCH /sessions/{id}/end.
+    avg_form_score: Mapped[float | None] = mapped_column(Float)
+    avg_asymmetry: Mapped[float | None] = mapped_column(Float)
 
     user: Mapped[User] = relationship(back_populates="workouts")
     sets: Mapped[list[Set]] = relationship(
@@ -96,6 +107,11 @@ class Rep(Base):
     left_asymmetry: Mapped[float | None] = mapped_column(Float)
     right_asymmetry: Mapped[float | None] = mapped_column(Float)
     compensation_detected: Mapped[bool | None] = mapped_column(Boolean)
+
+    # Phase 5/6 bilateral angle fields (see POST /sessions/{id}/reps schema).
+    left_angle: Mapped[float | None] = mapped_column(Float)
+    right_angle: Mapped[float | None] = mapped_column(Float)
+    asymmetry_pct: Mapped[float | None] = mapped_column(Float)
 
     set: Mapped[Set] = relationship(back_populates="reps")
     form_errors: Mapped[list[FormError]] = relationship(
