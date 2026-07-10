@@ -19,13 +19,13 @@ def test_ai_formula_known_input():
     # |105-95| / ((105+95)/2) * 100 = 10/100*100 = 10.0
     out = a.analyse_rep(105, 95)
     assert abs(out["ai_percent"] - 10.0) < 1e-9
-    assert out["dominant_side"] == "left"
+    assert out["dominant_side"] == "LEFT"
 
 
 def test_ai_zero_when_symmetric():
     out = AsymmetryAnalyser().analyse_rep(90, 90)
     assert out["ai_percent"] == 0.0
-    assert out["dominant_side"] == "none"
+    assert out["dominant_side"] == "NONE"
     assert out["risk_level"] == "OK"
 
 
@@ -46,7 +46,7 @@ def test_bilateral_imbalance_fires_after_three_sets():
         event = a.end_set()["event"]
     assert event is not None
     assert event["type"] == "BILATERAL_IMBALANCE"
-    assert event["dominant_side"] == "left"
+    assert event["dominant_side"] == "LEFT"
     assert "knee" in event["message"]
 
 
