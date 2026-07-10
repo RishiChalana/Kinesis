@@ -1,12 +1,7 @@
-import './App.css'
+import WorkoutView from './WorkoutView'
 
 function App() {
-  return (
-    <>
-      <h1>KINESIS</h1>
-      <p>Kinematic Intelligence for Neuromuscular Exercise and Session Insight</p>
-    </>
-  )
+  return <WorkoutView />
 }
 
 export default App

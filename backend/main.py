@@ -32,6 +32,7 @@ from backend.auth import (
 )
 from backend.connection_manager import ConnectionManager
 from backend.database import get_db
+from backend.frame_processor import FRAME_EXECUTOR, close_session, process_frame
 from backend.landmarks import resolve_landmark
 from backend.models import (
     FormError,
@@ -519,6 +520,8 @@ def build_frame_message(data: dict) -> dict:
         "state": data.get("state", "UP"),
         "form_score": data.get("form_score"),
         "active_errors": data.get("active_errors", []),
+        # [{id, x_norm, y_norm, visibility, ...}] — drives the canvas skeleton.
+        "landmarks": data.get("landmarks", []),
         "left_angle": data.get("left_angle"),
         "right_angle": data.get("right_angle"),
         # {ai_pct, dominant_side, risk} | null
@@ -526,6 +529,8 @@ def build_frame_message(data: dict) -> dict:
         # {phase, eccentric_s, isometric_s, concentric_s, eccentric_ok,
         #  concentric_ok} | null
         "tempo": data.get("tempo"),
+        # [{code, message, muscle, severity}] — Phase 7 compensation signatures.
+        "compensation_events": data.get("compensation_events", []),
     }
 
 
@@ -560,6 +565,21 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             if data.get("type") == "pong":
                 continue
 
-            await websocket.send_text(json.dumps(build_frame_message(data)))
+            frame_b64 = data.get("frame")
+            if frame_b64:
+                # Real webcam frame from the browser: run the pose pipeline off
+                # the event loop on the bounded FRAME_EXECUTOR (capped at 4
+                # workers) so many simultaneous sessions can't spawn unbounded
+                # MediaPipe threads.
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    FRAME_EXECUTOR, process_frame, session_id, frame_b64,
+                    data.get("exercise", "squat"),
+                )
+                await websocket.send_text(json.dumps(result))
+            else:
+                # No image (e.g. the test client): echo a schema-shaped message.
+                await websocket.send_text(json.dumps(build_frame_message(data)))
     except WebSocketDisconnect:
         manager.disconnect(session_id)
+        close_session(session_id)
