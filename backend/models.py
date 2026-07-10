@@ -130,3 +130,24 @@ class FormError(Base):
     frames_total: Mapped[int | None] = mapped_column(Integer)
 
     rep: Mapped[Rep] = relationship(back_populates="form_errors")
+
+
+class LandmarkFrame(Base):
+    """Phase 6 — raw pose landmark time-series, stored as a TimescaleDB
+    hypertable partitioned by `time`. Created by a hand-written migration
+    (raw SQL for create_hypertable + compression/retention policies), not by
+    autogenerate. The composite primary key includes the partitioning column
+    `time` as TimescaleDB requires, and lets the ORM map the class for
+    bulk_insert_mappings."""
+
+    __tablename__ = "landmark_frames"
+
+    time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True, nullable=False
+    )
+    session_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    landmark_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    frame_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    x_norm: Mapped[float | None] = mapped_column(Float)
+    y_norm: Mapped[float | None] = mapped_column(Float)
+    visibility: Mapped[float | None] = mapped_column(Float)

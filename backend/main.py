@@ -32,7 +32,16 @@ from backend.auth import (
 )
 from backend.connection_manager import ConnectionManager
 from backend.database import get_db
-from backend.models import FormError, Rep, Set, User, UserProfile, Workout
+from backend.landmarks import resolve_landmark
+from backend.models import (
+    FormError,
+    LandmarkFrame,
+    Rep,
+    Set,
+    User,
+    UserProfile,
+    Workout,
+)
 
 # Heartbeat timing (seconds).
 HEARTBEAT_IDLE_SECONDS = 10.0
@@ -461,6 +470,38 @@ def session_detail(
     return workout
 
 
+class AnglePoint(BaseModel):
+    timestamp: datetime
+    value: float | None
+
+
+@app.get("/sessions/{session_id}/angles", response_model=list[AnglePoint])
+def session_angles(
+    session_id: int,
+    landmark: str = Query(..., description="Landmark name (e.g. LEFT_KNEE) or id"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[AnglePoint]:
+    """Time-series of one landmark's y_norm trajectory across a session, for
+    Recharts. Reads the TimescaleDB hypertable ordered by time."""
+    _owned_workout(session_id, current_user, db)  # ownership + existence check
+
+    landmark_id = resolve_landmark(landmark)
+    if landmark_id is None:
+        raise HTTPException(status_code=422, detail=f"Unknown landmark '{landmark}'")
+
+    stmt = (
+        select(LandmarkFrame.time, LandmarkFrame.y_norm)
+        .where(
+            LandmarkFrame.session_id == session_id,
+            LandmarkFrame.landmark_id == landmark_id,
+        )
+        .order_by(LandmarkFrame.time)
+    )
+    rows = db.execute(stmt).all()
+    return [AnglePoint(timestamp=t, value=v) for t, v in rows]
+
+
 # --------------------------------------------------------------------------- #
 # WebSocket — live pose stream (see docs/websocket_schema.md)
 # --------------------------------------------------------------------------- #
@@ -468,21 +509,23 @@ manager = ConnectionManager()
 
 
 def build_frame_message(data: dict) -> dict:
-    """Build an outgoing frame message per the schema. Phase-5/6 fields are
-    placeholders (null/empty) for now; the CV client supplies frame_id, state,
-    rep_count and angles."""
+    """Build an outgoing frame message per docs/websocket_schema.md. The CV
+    client supplies the computed values; asymmetry/tempo are nested objects
+    (Phase 6) and may be null on frames where no rep just completed."""
     return {
         "frame_id": data.get("frame_id"),
         "timestamp": data.get("timestamp", time.time()),
         "rep_count": data.get("rep_count", 0),
         "state": data.get("state", "UP"),
-        "form_score": None,
-        "active_errors": [],
+        "form_score": data.get("form_score"),
+        "active_errors": data.get("active_errors", []),
         "left_angle": data.get("left_angle"),
         "right_angle": data.get("right_angle"),
-        "asymmetry_pct": None,
-        "tempo_phase": None,
-        "tempo_seconds": None,
+        # {ai_pct, dominant_side, risk} | null
+        "asymmetry": data.get("asymmetry"),
+        # {phase, eccentric_s, isometric_s, concentric_s, eccentric_ok,
+        #  concentric_ok} | null
+        "tempo": data.get("tempo"),
     }
 
 

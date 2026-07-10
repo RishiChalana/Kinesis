@@ -15,21 +15,32 @@ per session; the server tracks it in `ConnectionManager`.
 
 ## Outgoing — server → frontend (one message per processed frame)
 
+> **Phase 6 shape change:** the flat `asymmetry_pct` / `tempo_phase` /
+> `tempo_seconds` fields were replaced by nested `asymmetry` and `tempo`
+> objects. Both are `null` on frames where the value doesn't apply (e.g. no rep
+> just completed).
+
 ```json
 {
   "frame_id": 0,
   "timestamp": 1732200000.123,
-  "rep_count": 0,
-  "state": "UP",
-  "form_score": null,
+  "rep_count": 3,
+  "state": "DOWN",
+  "form_score": 82.0,
   "active_errors": [
     { "code": "KNEE_CAVE", "message": "Left knee caving inward", "severity": "HIGH" }
   ],
-  "left_angle": 172.4,
-  "right_angle": 170.9,
-  "asymmetry_pct": null,
-  "tempo_phase": null,
-  "tempo_seconds": null
+  "left_angle": 88.5,
+  "right_angle": 91.2,
+  "asymmetry": { "ai_pct": 3.0, "dominant_side": "right", "risk": "OK" },
+  "tempo": {
+    "phase": "eccentric",
+    "eccentric_s": 2.8,
+    "isometric_s": 0.9,
+    "concentric_s": 1.4,
+    "eccentric_ok": true,
+    "concentric_ok": true
+  }
 }
 ```
 
@@ -43,13 +54,11 @@ per session; the server tracks it in `ConnectionManager`.
 | `active_errors` | array | `[{code, message, severity}]`; empty when clean | Phase 5 |
 | `left_angle` | float \| null | Left-side monitored joint angle (deg) | Phase 4/6 |
 | `right_angle` | float \| null | Right-side monitored joint angle (deg) | Phase 4/6 |
-| `asymmetry_pct` | float \| null | Bilateral asymmetry index (%) | Phase 6 |
-| `tempo_phase` | string \| null | `"eccentric"` / `"isometric"` / `"concentric"` | Phase 6 |
-| `tempo_seconds` | float \| null | Seconds elapsed in the current tempo phase | Phase 6 |
+| `asymmetry` | object \| null | `{ai_pct, dominant_side, risk}` — bilateral AI for the last rep | Phase 6 |
+| `tempo` | object \| null | `{phase, eccentric_s, isometric_s, concentric_s, eccentric_ok, concentric_ok}` | Phase 6 |
 
-`form_score`, `active_errors`, `asymmetry_pct`, `tempo_phase`, and
-`tempo_seconds` are placeholders (null / empty) in Phase 4 and get populated in
-Phases 5–6.
+`asymmetry.risk` is `"OK"` / `"WARNING"` / `"HIGH"`; `dominant_side` is
+`"left"` / `"right"` / `"none"`. `tempo.phase` is the current phase name.
 
 ## Incoming — frontend → server
 
