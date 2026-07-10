@@ -41,6 +41,20 @@ def create_access_token(user_id: int) -> str:
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
+def get_user_id_from_token(token: str | None) -> int | None:
+    """Decode a JWT and return its user id, or None if the token is missing,
+    malformed, or expired. Used by the WebSocket handshake (which can't use the
+    Depends-based get_current_user). Never raises — invalid == unauthenticated."""
+    if not token or not SECRET_KEY:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        sub = payload.get("sub")
+        return int(sub) if sub is not None else None
+    except (JWTError, ValueError):
+        return None
+
+
 def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db),

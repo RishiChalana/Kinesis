@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session, selectinload
 from backend.auth import (
     create_access_token,
     get_current_user,
+    get_user_id_from_token,
     hash_password,
     verify_password,
 )
@@ -447,6 +448,18 @@ def end_session(
     workout.ended_at = datetime.now(timezone.utc)
     workout.avg_form_score = float(avg_form) if avg_form is not None else None
     workout.avg_asymmetry = float(avg_asym) if avg_asym is not None else None
+
+    # Per-set average form score (dashboard + DB-consistency checks).
+    set_avgs = db.execute(
+        select(Rep.set_id, func.avg(Rep.form_score))
+        .join(Set, Rep.set_id == Set.id)
+        .where(Set.workout_id == workout.id)
+        .group_by(Rep.set_id)
+    ).all()
+    for set_id, set_avg in set_avgs:
+        set_row = db.get(Set, set_id)
+        set_row.avg_form_score = float(set_avg) if set_avg is not None else None
+
     db.commit()
     db.refresh(workout)
 
@@ -679,7 +692,23 @@ def _save_signature(sess, user_id):
 
 
 @app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
+async def websocket_endpoint(
+    websocket: WebSocket,
+    session_id: str,
+    token: str | None = Query(default=None),
+):
+    # SECURITY: authenticate the connection via a JWT before accepting it. The
+    # user id comes from the verified token — never from a client-supplied field.
+    ws_user_id = get_user_id_from_token(token)
+    if ws_user_id is None:
+        # Closing before accept() rejects the handshake (HTTP 403).
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    with SessionLocal() as db:
+        if db.get(User, ws_user_id) is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
     await manager.connect(websocket, session_id)
     try:
         while True:
@@ -712,7 +741,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             frame_b64 = data.get("frame")
             if frame_b64:
                 exercise = data.get("exercise", "squat")
-                user_id = data.get("user_id")
+                # user_id is taken from the verified JWT, NOT the frame payload.
+                user_id = ws_user_id
                 # First frame for this session? (created lazily in process_frame)
                 first_frame = get_processing_session(session_id) is None
 

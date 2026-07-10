@@ -1,68 +1,35 @@
-"""Phase 7 — server-side per-frame pose processing for the live WebSocket.
+"""WebSocket frame-processing wrapper (Phase 9 refactor).
 
-Decodes a base64 JPEG from the browser, runs MediaPipe Pose, and returns the
-full frame message (landmarks + rep count + bilateral asymmetry + tempo +
-compensation events) defined in docs/websocket_schema.md. One stateful
-ProcessingSession per WebSocket session_id.
+Thin adapter around ml.pipeline.KinesisPipeline: it owns only the concerns the
+pipeline shouldn't — base64 JPEG decode, the session registry, and the bounded
+thread pool. All actual pose/rep/metric logic lives in KinesisPipeline.
 
-CPU-bound work (decode + MediaPipe) is run OFF the event loop on FRAME_EXECUTOR,
-a shared bounded thread pool (see the executor comment below).
-
-PRIVACY: the decoded pixel frame lives only in memory for the duration of one
-process() call — it is flipped, colour-converted, and handed to MediaPipe, then
-discarded when the function returns. It is never written to disk, never inserted
-into any table, and never sent back over the socket. Only derived NUMERIC data
-(landmark coordinates, angles, counts) leaves this module. See docs/privacy_notes.md.
+PRIVACY: the decoded pixel frame lives only in memory for one process_frame()
+call — flipped, colour-converted, handed to MediaPipe, then discarded. It is
+never written to disk, never inserted into any table, never sent back over the
+socket. Only derived numeric data leaves here. See docs/privacy_notes.md.
 """
 
 import base64
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
-import mediapipe as mp
 import numpy as np
 
-from ml.angles import calculate_angle
-from ml.asymmetry import AsymmetryAnalyser
-from ml.compensation import CompensationDetector
-from ml.fatigue import FatigueDetector
-from ml.pose import extract_landmarks
-from ml.rep_counter import RepCounter
-from ml.signature import RepTrajectory, SignatureModel
-from ml.tempo import TempoAnalyser
+from ml.pipeline import ANGLE_TRIPLES, MISSED_FRAMES_LIMIT, KinesisPipeline
 
-mp_pose = mp.solutions.pose
+# Back-compat alias: pre-refactor code/tests referred to ProcessingSession.
+ProcessingSession = KinesisPipeline
 
-# asyncio.to_thread() would use the loop's DEFAULT executor, which is bounded at
-# min(32, cpu+4) threads and shared with all other run_in_executor work — too
-# many concurrent MediaPipe inferences under load. Use an explicit, small pool
-# instead and cap it so N simultaneous sessions can't spawn unbounded threads.
+__all__ = [
+    "FRAME_EXECUTOR", "MISSED_FRAMES_LIMIT", "ANGLE_TRIPLES", "ProcessingSession",
+    "KinesisPipeline", "process_frame", "get_processing_session", "close_session",
+]
+
+# asyncio.to_thread() would use the loop's DEFAULT executor (bounded at
+# min(32, cpu+4), shared with all other run_in_executor work) — too many
+# concurrent MediaPipe inferences under load. Use an explicit, small pool.
 FRAME_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mp-infer")
-
-# Consecutive missing-landmark frames before we declare tracking lost.
-MISSED_FRAMES_LIMIT = 15
-
-# (point_a, vertex, point_c) landmark ids per side for the primary joint angle.
-ANGLE_TRIPLES = {
-    "squat": {"left": (23, 25, 27), "right": (24, 26, 28)},
-    "deadlift": {"left": (11, 23, 25), "right": (12, 24, 26)},
-    "bicep_curl": {"left": (11, 13, 15), "right": (12, 14, 16)},
-    "pushup": {"left": (11, 13, 15), "right": (12, 14, 16)},
-    "lunge": {"left": (23, 25, 27), "right": (24, 26, 28)},
-}
-
-
-def _angle(landmarks, triple):
-    pts = []
-    for idx in triple:
-        if idx >= len(landmarks):
-            return None
-        lm = landmarks[idx]
-        if lm["visibility"] <= 0.5:
-            return None
-        pts.append({"x": lm["x_px"], "y": lm["y_px"]})
-    return calculate_angle(pts[0], pts[1], pts[2])
 
 
 def _decode(frame_b64):
@@ -74,205 +41,29 @@ def _decode(frame_b64):
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-class ProcessingSession:
-    def __init__(self, exercise="squat"):
-        self.exercise = exercise if exercise in ANGLE_TRIPLES else "squat"
-        self.pose = mp_pose.Pose(
-            model_complexity=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.5,
-        )
-        self.counter = RepCounter.for_exercise(self.exercise)
-        self.asymmetry = AsymmetryAnalyser(self.exercise)
-        self.tempo = TempoAnalyser()
-        self.compensation = CompensationDetector(self.exercise)
-        self.fatigue = FatigueDetector()
-        self.signature = SignatureModel(user_id=None, exercise=self.exercise)
-
-        self.frame_id = 0
-        self.prev_state = self.counter.state
-        self._bottom_left = None
-        self._bottom_right = None
-        self._rep_trajectory = None
-        self.last_asymmetry = None
-        self.last_tempo = None
-        self.last_form_score = None
-        self.last_fatigue = None
-        self.last_signature = None
-        self.missed_frames = 0
-        # Set True when a fresh baseline is computed and needs persisting; the
-        # WS handler reads this, saves to movement_signatures, and clears it.
-        self.signature_needs_save = False
-
-    def process(self, frame_bgr):
-        """Run pose on a decoded BGR frame, then process the landmarks. The
-        pixel frame is used only here and discarded on return (see PRIVACY)."""
-        now = time.perf_counter()
-        frame_bgr = cv2.flip(frame_bgr, 1)
-        h, w = frame_bgr.shape[:2]
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        results = self.pose.process(rgb)
-        rgb.flags.writeable = True
-        landmarks = extract_landmarks(results, w, h)
-        return self.process_landmarks(landmarks, now=now)
-
-    def process_landmarks(self, landmarks, now=None):
-        """Advance all analysers for one frame's landmarks. Split out from
-        process() so it can be unit-tested without a real image/MediaPipe, and
-        so a missing-person frame (empty landmarks) is handled gracefully:
-        the RepCounter is simply not updated (no double-count, no reset), and
-        after MISSED_FRAMES_LIMIT consecutive misses we report TRACKING_LOST."""
-        now = time.perf_counter() if now is None else now
-        self.frame_id += 1
-
-        # Track how long the person has been out of frame.
-        if landmarks:
-            self.missed_frames = 0
-        else:
-            self.missed_frames += 1
-
-        triples = ANGLE_TRIPLES[self.exercise]
-        left_angle = _angle(landmarks, triples["left"])
-        right_angle = _angle(landmarks, triples["right"])
-
-        compensation_events = self.compensation.update_frame(
-            landmarks, self.counter.state, now=now)
-
-        # Rep state transitions.
-        if left_angle is not None:
-            # UP -> DOWN: begin a new rep's tempo tracking.
-            if self.counter.state == "UP":
-                pass
-            completed = self.counter.update(left_angle, self.frame_id)
-            if self.prev_state == "UP" and self.counter.state == "DOWN":
-                self.tempo.start_rep()
-                self._rep_trajectory = RepTrajectory()
-                self._bottom_left = None
-                self._bottom_right = None
-            if self.counter.state == "DOWN":
-                self.tempo.observe(left_angle, now)
-                if self._rep_trajectory is not None:
-                    self._rep_trajectory.add(left_angle, now)
-                if self._bottom_left is None or left_angle < self._bottom_left:
-                    self._bottom_left = left_angle
-                    self._bottom_right = right_angle
-            if completed:
-                self._on_rep_complete(compensation_events)
-            self.prev_state = self.counter.state
-
-        # rep_count and the real UP/DOWN state are preserved across the gap;
-        # we only override the *reported* state so the UI can show "we lost you"
-        # instead of freezing on stale data or guessing.
-        tracking_lost = self.missed_frames > MISSED_FRAMES_LIMIT
-        return {
-            "frame_id": self.frame_id,
-            "timestamp": time.time(),
-            "rep_count": self.counter.count,
-            "state": "TRACKING_LOST" if tracking_lost else self.counter.state,
-            "active_errors": [],
-            "landmarks": [
-                {"id": lm["id"], "x_norm": lm["x_norm"], "y_norm": lm["y_norm"],
-                 "visibility": lm["visibility"]}
-                for lm in landmarks
-            ],
-            "form_score": self.last_form_score,
-            "left_angle": left_angle,
-            "right_angle": right_angle,
-            "asymmetry": self.last_asymmetry,
-            "tempo": self.last_tempo,
-            "compensation_events": compensation_events,
-            "fatigue": self.last_fatigue,
-            "signature": self.last_signature,
-        }
-
-    def _on_rep_complete(self, compensation_events):
-        if self._bottom_left is not None and self._bottom_right is not None:
-            res = self.asymmetry.analyse_rep(self._bottom_left, self._bottom_right)
-            self.last_asymmetry = {
-                "ai_pct": res["ai_percent"],
-                "dominant_side": res["dominant_side"],
-                "risk": res["risk_level"],
-            }
-        if self.counter.entered_down_at and self.counter.exited_down_at:
-            durations = self.tempo.finalize(
-                self.counter.entered_down_at, self.counter.exited_down_at)
-            scored = {s["phase"]: s["ok"] for s in self.tempo.score_tempo(self.exercise)}
-            self.last_tempo = {
-                "phase": "concentric",
-                "eccentric_s": durations["eccentric_s"],
-                "isometric_s": durations["isometric_s"],
-                "concentric_s": durations["concentric_s"],
-                "eccentric_ok": scored.get("eccentric"),
-                "concentric_ok": scored.get("concentric"),
-            }
-        # Compensation (inter-rep trend signatures) — every-frame update already ran.
-        rep_comp_events = self.compensation.analyse_rep_complete()
-        compensation_events.extend(rep_comp_events)
-
-        # Lightweight form score (interim stand-in for a full FormChecker):
-        # start at 100, deduct for asymmetry risk, off-target tempo, compensation.
-        self.last_form_score = self._score_rep(rep_comp_events, compensation_events)
-
-        # Fatigue: append this rep's score, read the within-set slope.
-        self.last_fatigue = self.fatigue.add(self.last_form_score)
-
-        # Movement signature: build the rep trajectory, keep it if it's a good
-        # rep, and compare against the personal baseline once one exists.
-        traj = self._rep_trajectory.normalise() if self._rep_trajectory else None
-        if traj is not None:
-            self.signature.add_good_rep(traj, self.last_form_score)
-            # Build a fresh baseline only if we don't already have one (a loaded
-            # baseline is kept, not overwritten). Flag it for the WS handler to
-            # persist the first time it's successfully computed.
-            if self.signature.baseline_mean is None:
-                if self.signature.compute_baseline():
-                    self.signature_needs_save = True
-            self.last_signature = self.signature.compare(traj)
-        self._rep_trajectory = None
-
-    def _score_rep(self, rep_comp_events, all_comp_events):
-        score = 100.0
-        if self.last_asymmetry:
-            risk = self.last_asymmetry["risk"]
-            score -= 10 if risk == "WARNING" else 25 if risk == "HIGH" else 0
-        if self.last_tempo:
-            if self.last_tempo.get("eccentric_ok") is False:
-                score -= 10
-            if self.last_tempo.get("concentric_ok") is False:
-                score -= 10
-        if all_comp_events:
-            score -= 20
-        return max(0.0, min(100.0, score))
-
-    def close(self):
-        self.pose.close()
-
-
-_sessions: dict[str, ProcessingSession] = {}
+_sessions: dict[str, KinesisPipeline] = {}
 
 
 def get_processing_session(session_id):
-    """Return the live ProcessingSession for a WS session_id, or None. Lets the
+    """Return the live KinesisPipeline for a WS session_id, or None. Lets the
     WS handler (which holds the DB) inspect/persist the signature model."""
     return _sessions.get(session_id)
 
 
 def process_frame(session_id, frame_b64, exercise="squat", user_id=None):
     """Decode + process one frame for a session. Returns a frame message dict."""
-    sess = _sessions.get(session_id)
-    if sess is None:
-        sess = ProcessingSession(exercise)
-        sess.signature.user_id = user_id
-        _sessions[session_id] = sess
+    pipe = _sessions.get(session_id)
+    if pipe is None:
+        pipe = KinesisPipeline(exercise=exercise, user_id=user_id)
+        _sessions[session_id] = pipe
     frame = _decode(frame_b64)
     if frame is None:
         # Undecodable frame counts as a missed frame, same as no-person.
-        return sess.process_landmarks([])
-    return sess.process(frame)
+        return pipe.process_landmarks([])
+    return pipe.process_frame(frame)
 
 
 def close_session(session_id):
-    sess = _sessions.pop(session_id, None)
-    if sess is not None:
-        sess.close()
+    pipe = _sessions.pop(session_id, None)
+    if pipe is not None:
+        pipe.close()

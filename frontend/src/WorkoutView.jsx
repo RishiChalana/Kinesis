@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import AlertStack from "./components/AlertStack";
 import RepCounter from "./components/RepCounter";
-import { getUserId } from "./api";
+import { getToken } from "./api";
 import { drawSkeleton } from "./skeleton";
 import "./WorkoutView.css";
 
@@ -18,11 +18,15 @@ export default function WorkoutView() {
   const streamRef = useRef(null);
   const lastSentRef = useRef(0);
   const alertsRef = useRef(new Map());
+  const manualCloseRef = useRef(false);
+  const reconnectTimerRef = useRef(null);
 
   const [sessionId, setSessionId] = useState("demo");
   const [exercise, setExercise] = useState("squat");
   const [connected, setConnected] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
   const [cameraError, setCameraError] = useState(null);
+  const [toast, setToast] = useState(null);
   const [frame, setFrame] = useState({ rep_count: 0, state: "UP", form_score: null });
   const [alerts, setAlerts] = useState([]);
 
@@ -113,13 +117,8 @@ export default function WorkoutView() {
         const ctx = c.getContext("2d");
         ctx.drawImage(video, 0, 0, c.width, c.height);
         const b64 = c.toDataURL("image/jpeg", 0.6);
-        // user_id (when logged in) lets the backend load/save the movement
-        // signature baseline for this user+exercise.
-        const uid = getUserId();
-        ws.send(JSON.stringify({
-          frame: b64, session_id: sessionId, exercise,
-          user_id: uid ? Number(uid) : null,
-        }));
+        // No user_id here — the backend derives it from the authenticated JWT.
+        ws.send(JSON.stringify({ frame: b64, session_id: sessionId, exercise }));
       }
     }
     rafRef.current = requestAnimationFrame(loop);
@@ -127,35 +126,69 @@ export default function WorkoutView() {
 
   function connect() {
     if (wsRef.current) return;
-    const ws = new WebSocket(`${WS_HOST}/ws/${sessionId}`);
+    const token = getToken();
+    if (!token) {
+      setToast("Log in (top-right) before starting a workout.");
+      return;
+    }
+    manualCloseRef.current = false;
+    // Token is sent as a query param — the backend rejects the handshake if it's
+    // missing/expired, so an unauthenticated user never opens a live stream.
+    const ws = new WebSocket(
+      `${WS_HOST}/ws/${sessionId}?token=${encodeURIComponent(token)}`);
     ws.onopen = () => {
       setConnected(true);
+      setReconnecting(false);
       rafRef.current = requestAnimationFrame(loop);
     };
     ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        setToast("Processing error, try again.");   // malformed server frame
+        return;
+      }
       if (msg.type === "ping") {
         ws.send(JSON.stringify({ type: "pong" }));
         return;
       }
       handleMessage(msg);
     };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       setConnected(false);
       wsRef.current = null;
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (manualCloseRef.current) return;   // user pressed Stop — no reconnect
+      if (ev.code === 1008) {
+        setToast("Session not authorized — please log in again.");
+        return;
+      }
+      // Unexpected drop mid-session: show banner, auto-reconnect after 2s.
+      setReconnecting(true);
+      reconnectTimerRef.current = setTimeout(connect, 2000);
     };
     wsRef.current = ws;
   }
 
   function disconnect() {
+    manualCloseRef.current = true;
+    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     if (wsRef.current) wsRef.current.close();
     wsRef.current = null;
     setConnected(false);
+    setReconnecting(false);
   }
 
   useEffect(() => () => disconnect(), []); // cleanup on unmount
+
+  // Auto-dismiss toasts after 4s.
+  useEffect(() => {
+    if (!toast) return;
+    const id = setTimeout(() => setToast(null), 4000);
+    return () => clearTimeout(id);
+  }, [toast]);
 
   return (
     <div className="workout">
@@ -186,6 +219,11 @@ export default function WorkoutView() {
           <video ref={videoRef} autoPlay playsInline muted className="feed" />
           <canvas ref={overlayRef} width={640} height={480} className="overlay" />
           {cameraError && <div className="camera-error">{cameraError}</div>}
+          {reconnecting && (
+            <div className="reconnect-banner">
+              Connection lost — reconnecting…
+            </div>
+          )}
         </div>
 
         <RepCounter repCount={frame.rep_count} state={frame.state}
@@ -193,6 +231,7 @@ export default function WorkoutView() {
       </div>
 
       <AlertStack alerts={alerts} />
+      {toast && <div className="toast" onClick={() => setToast(null)}>{toast}</div>}
       <canvas ref={hiddenCanvasRef} width={640} height={480} style={{ display: "none" }} />
     </div>
   );

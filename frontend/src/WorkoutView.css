@@ -124,6 +124,30 @@
 .form-gauge { margin-top: 16px; text-align: center; }
 .form-gauge-label { letter-spacing: 3px; color: #9aa; font-size: 12px; margin-top: -6px; }
 
+.reconnect-banner {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  padding: 10px;
+  text-align: center;
+  background: rgba(217, 119, 6, 0.92);
+  color: #fff;
+  font-weight: 700;
+}
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #b3261e;
+  color: #fff;
+  padding: 12px 20px;
+  border-radius: 8px;
+  font-weight: 600;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  z-index: 60;
+}
+
 /* Alert stack */
 .alert-stack {
   position: fixed;

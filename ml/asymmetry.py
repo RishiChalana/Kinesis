@@ -40,11 +40,11 @@ class AsymmetryAnalyser:
         ai = abs(left_angle - right_angle) / mean * 100 if mean else 0.0
 
         if left_angle > right_angle:
-            dominant = "left"
+            dominant = "LEFT"
         elif right_angle > left_angle:
-            dominant = "right"
+            dominant = "RIGHT"
         else:
-            dominant = "none"
+            dominant = "NONE"
 
         if ai > 15:
             risk = HIGH
@@ -64,9 +64,9 @@ class AsymmetryAnalyser:
         if not self._current_set:
             return None
         avg_ai = sum(a for a, _ in self._current_set) / len(self._current_set)
-        left_n = sum(1 for _, d in self._current_set if d == "left")
-        right_n = sum(1 for _, d in self._current_set if d == "right")
-        side = "left" if left_n > right_n else ("right" if right_n > left_n else "none")
+        left_n = sum(1 for _, d in self._current_set if d == "LEFT")
+        right_n = sum(1 for _, d in self._current_set if d == "RIGHT")
+        side = "LEFT" if left_n > right_n else ("RIGHT" if right_n > left_n else "NONE")
 
         self._set_averages.append((avg_ai, side))
         self._current_set = []
@@ -86,18 +86,18 @@ class AsymmetryAnalyser:
         if (
             all(ai > IMBALANCE_AI_THRESHOLD for ai, _ in recent)
             and len(sides) == 1
-            and "none" not in sides
+            and "NONE" not in sides
         ):
             side = recent[0][1]
-            other = "right" if side == "left" else "left"
+            other = "RIGHT" if side == "LEFT" else "LEFT"
             return {
                 "type": "BILATERAL_IMBALANCE",
                 "dominant_side": side,
                 "sets": IMBALANCE_SET_STREAK,
                 "message": (
                     f"{side.capitalize()} {self.joint} angle consistently "
-                    f"greater than {other} across {IMBALANCE_SET_STREAK} sets "
-                    f"— possible {other}-side weakness."
+                    f"greater than {other.lower()} across {IMBALANCE_SET_STREAK} "
+                    f"sets — possible {other.lower()}-side weakness."
                 ),
             }
         return None

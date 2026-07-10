@@ -73,7 +73,8 @@ class Workout(Base):
     __tablename__ = "workouts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True)  # Phase 9 index
     exercise: Mapped[str] = mapped_column(String, nullable=False)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -94,7 +95,8 @@ class Set(Base):
     __tablename__ = "sets"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    workout_id: Mapped[int] = mapped_column(ForeignKey("workouts.id"), nullable=False)
+    workout_id: Mapped[int] = mapped_column(
+        ForeignKey("workouts.id"), nullable=False, index=True)  # Phase 9 index
     set_number: Mapped[int] = mapped_column(Integer, nullable=False)
     avg_form_score: Mapped[float | None] = mapped_column(Float)
 
@@ -108,7 +110,8 @@ class Rep(Base):
     __tablename__ = "reps"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    set_id: Mapped[int] = mapped_column(ForeignKey("sets.id"), nullable=False)
+    set_id: Mapped[int] = mapped_column(
+        ForeignKey("sets.id"), nullable=False, index=True)  # Phase 9 index
     rep_number: Mapped[int] = mapped_column(Integer, nullable=False)
     form_score: Mapped[float | None] = mapped_column(Float)
     tempo_eccentric_s: Mapped[float | None] = mapped_column(Float)
@@ -133,7 +136,8 @@ class FormError(Base):
     __tablename__ = "form_errors"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    rep_id: Mapped[int] = mapped_column(ForeignKey("reps.id"), nullable=False)
+    rep_id: Mapped[int] = mapped_column(
+        ForeignKey("reps.id"), nullable=False, index=True)  # Phase 9 index
     error_code: Mapped[str] = mapped_column(String, nullable=False)
     severity: Mapped[str | None] = mapped_column(String)
     frame_count: Mapped[int | None] = mapped_column(Integer)

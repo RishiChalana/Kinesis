@@ -29,24 +29,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cv2
 import mediapipe as mp
 
-from ml.angles import calculate_angle
-from ml.rep_counter import RepCounter
-
 mp_pose = mp.solutions.pose
 mp_draw = mp.solutions.drawing_utils
 
 # Visibility below this is unreliable — gate every landmark use on it.
 VISIBILITY_THRESHOLD = 0.5
-
-# Primary angle per exercise as a (point_a, vertex_b, point_c) triple of
-# MediaPipe landmark IDs. The vertex is the monitored joint. Left side is used.
-POSE_ANGLE_LANDMARKS = {
-    "squat": (23, 25, 27),       # hip -> knee -> ankle  (knee angle)
-    "deadlift": (11, 23, 25),    # shoulder -> hip -> knee (hip angle)
-    "bicep_curl": (11, 13, 15),  # shoulder -> elbow -> wrist (elbow angle)
-    "pushup": (11, 13, 15),      # shoulder -> elbow -> wrist (elbow angle)
-    "lunge": (23, 25, 27),       # hip -> front knee -> ankle (knee angle)
-}
 
 
 def extract_landmarks(results, frame_w, frame_h):
@@ -78,31 +65,28 @@ def extract_landmarks(results, frame_w, frame_h):
     return landmarks
 
 
-def _angle_for_exercise(landmarks, exercise):
-    """Compute the monitored joint angle for `exercise` from the canonical
-    landmark list. Returns None if the required landmarks are missing or not
-    confidently visible (all three must clear the visibility gate)."""
-    triple = POSE_ANGLE_LANDMARKS[exercise]
-    pts = []
-    for idx in triple:
-        if idx >= len(landmarks):
-            return None
-        lm = landmarks[idx]
+def _draw_skeleton(frame, landmarks, w, h):
+    """Draw landmark dots from the pipeline's canonical landmark list (green
+    circles). The full connection skeleton is drawn on the frontend canvas."""
+    for lm in landmarks:
         if lm["visibility"] <= VISIBILITY_THRESHOLD:
-            return None
-        pts.append({"x": lm["x_px"], "y": lm["y_px"]})
-    return calculate_angle(pts[0], pts[1], pts[2])
+            continue
+        cv2.circle(frame, (int(lm["x_norm"] * w), int(lm["y_norm"] * h)),
+                   4, (0, 255, 0), -1)
 
 
 def main():
-    # Exercise selected via CLI, e.g. `python ml/pose.py squat`. Default: squat.
-    exercise = sys.argv[1] if len(sys.argv) > 1 else "squat"
-    if exercise not in POSE_ANGLE_LANDMARKS:
-        print(f"Unknown exercise '{exercise}'. Choose from "
-              f"{sorted(POSE_ANGLE_LANDMARKS)}.")
-        return
-    counter = RepCounter.for_exercise(exercise)
+    # Post-refactor, this standalone script is a thin wrapper around
+    # KinesisPipeline — no duplicated angle/rep logic lives here anymore.
+    # Lazy import avoids a circular import (ml.pipeline imports ml.pose).
+    from ml.pipeline import ANGLE_TRIPLES, KinesisPipeline
 
+    exercise = sys.argv[1] if len(sys.argv) > 1 else "squat"
+    if exercise not in ANGLE_TRIPLES:
+        print(f"Unknown exercise '{exercise}'. Choose from {sorted(ANGLE_TRIPLES)}.")
+        return
+
+    pipe = KinesisPipeline(exercise=exercise)
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("ERROR: could not open webcam (VideoCapture(0)).")
@@ -110,86 +94,46 @@ def main():
 
     prev_time = time.time()
     shape_printed = False
-    frame_num = 0
-
-    # model_complexity=1 is the balanced option (0 fastest/less accurate,
-    # 2 most accurate/slow). Detection/tracking confidences per Phase 3 spec.
-    with mp_pose.Pose(
-        model_complexity=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.5,
-    ) as pose:
+    try:
         while True:
             ret, frame = cap.read()
             if not ret:
                 print("ERROR: failed to read frame; stopping.")
                 break
 
-            frame = cv2.flip(frame, 1)
             frame = cv2.resize(frame, (640, 480))
+            frame = cv2.flip(frame, 1)  # mirror for display
             frame_h, frame_w = frame.shape[:2]
-
             if not shape_printed:
                 print(f"frame.shape = {frame.shape}")
                 shape_printed = True
 
-            # MediaPipe needs RGB, not BGR. Marking the array non-writeable
-            # before process() lets MediaPipe pass it by reference (no copy) —
-            # a required perf optimisation. Restore writeable afterwards.
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable = False
-            results = pose.process(rgb)
-            rgb.flags.writeable = True
+            # flip=False: we already mirrored the display frame, so the pipeline
+            # must not flip again (landmarks then align with what's on screen).
+            result = pipe.process_frame(frame, flip=False)
+            _draw_skeleton(frame, result["landmarks"], frame_w, frame_h)
 
-            # Canonical landmark list — empty if no person detected.
-            landmarks = extract_landmarks(results, frame_w, frame_h)
+            now = time.time()
+            fps = 1.0 / (now - prev_time) if now > prev_time else 0.0
+            prev_time = now
 
-            # Draw the skeleton: green landmark circles, white connection lines.
-            if results.pose_landmarks is not None:
-                mp_draw.draw_landmarks(
-                    frame,
-                    results.pose_landmarks,
-                    mp_pose.POSE_CONNECTIONS,
-                    mp_draw.DrawingSpec(
-                        color=(0, 255, 0), thickness=2, circle_radius=3
-                    ),
-                    mp_draw.DrawingSpec(color=(255, 255, 255), thickness=2),
-                )
-
-            # Compute the monitored joint angle and feed the rep counter.
-            angle = _angle_for_exercise(landmarks, exercise)
-            if angle is not None:
-                counter.update(angle, frame_num)
-
-            current_time = time.time()
-            elapsed = current_time - prev_time
-            fps = 1.0 / elapsed if elapsed > 0 else 0.0
-            prev_time = current_time
-
-            # HUD: FPS, exercise + live angle, rep count and state.
-            cv2.putText(
-                frame, f"FPS: {fps:.1f}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
-            )
-            angle_text = f"{exercise} angle: {angle:.0f}" if angle is not None \
-                else f"{exercise} angle: --"
-            cv2.putText(
-                frame, angle_text, (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
-            )
-            cv2.putText(
-                frame, f"REPS: {counter.count}  ({counter.state})", (10, 95),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2,
-            )
+            angle = result["left_angle"]
+            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(frame,
+                        f"{exercise} angle: {angle:.0f}" if angle is not None
+                        else f"{exercise} angle: --",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(frame, f"REPS: {result['rep_count']}  ({result['state']})",
+                        (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
             cv2.imshow("KINESIS pose", frame)
-
-            frame_num += 1
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-
-    cap.release()
-    cv2.destroyAllWindows()
+    finally:
+        pipe.close()
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
