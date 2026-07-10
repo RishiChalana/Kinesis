@@ -31,12 +31,19 @@ from backend.auth import (
     verify_password,
 )
 from backend.connection_manager import ConnectionManager
-from backend.database import get_db
-from backend.frame_processor import FRAME_EXECUTOR, close_session, process_frame
+from backend.correctives import CORRECTIVES, get_corrective
+from backend.database import SessionLocal, get_db
+from backend.frame_processor import (
+    FRAME_EXECUTOR,
+    close_session,
+    get_processing_session,
+    process_frame,
+)
 from backend.landmarks import resolve_landmark
 from backend.models import (
     FormError,
     LandmarkFrame,
+    MovementSignature,
     Rep,
     Set,
     User,
@@ -101,6 +108,8 @@ class SessionResponse(BaseModel):
     exercise: str
     started_at: datetime
     ended_at: datetime | None = None
+    avg_form_score: float | None = None
+    avg_asymmetry: float | None = None
 
 
 class SessionStartResponse(BaseModel):
@@ -125,6 +134,7 @@ class RepCreate(BaseModel):
     form_score: float | None = None
     tempo_eccentric_s: float | None = None
     tempo_concentric_s: float | None = None
+    tempo_isometric_s: float | None = None
     left_angle: float | None = None
     right_angle: float | None = None
     asymmetry_pct: float | None = None
@@ -185,6 +195,7 @@ class RepOut(BaseModel):
     form_score: float | None = None
     tempo_eccentric_s: float | None = None
     tempo_concentric_s: float | None = None
+    tempo_isometric_s: float | None = None
     left_angle: float | None = None
     right_angle: float | None = None
     asymmetry_pct: float | None = None
@@ -391,6 +402,7 @@ def save_rep(
         form_score=payload.form_score,
         tempo_eccentric_s=payload.tempo_eccentric_s,
         tempo_concentric_s=payload.tempo_concentric_s,
+        tempo_isometric_s=payload.tempo_isometric_s,
         left_angle=payload.left_angle,
         right_angle=payload.right_angle,
         asymmetry_pct=payload.asymmetry_pct,
@@ -504,6 +516,94 @@ def session_angles(
 
 
 # --------------------------------------------------------------------------- #
+# Corrective engine + dashboard aggregates (Phase 8)
+# --------------------------------------------------------------------------- #
+@app.get("/correctives/{error_code}")
+def get_correctives(error_code: str):
+    """Corrective prescription for a form-error code (public reference data)."""
+    entry = get_corrective(error_code)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"No corrective for '{error_code}'")
+    return {"error_code": error_code.upper(), **entry}
+
+
+@app.get("/correctives")
+def list_correctives():
+    return sorted(CORRECTIVES.keys())
+
+
+class ErrorCount(BaseModel):
+    error_code: str
+    count: int
+
+
+@app.get("/users/{user_id}/common-errors", response_model=list[ErrorCount])
+def common_errors(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[ErrorCount]:
+    """Top 8 form-error codes by frequency for a user, sorted descending."""
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Cannot read another user's errors")
+    stmt = (
+        select(FormError.error_code, func.count(FormError.id).label("n"))
+        .select_from(FormError)
+        .join(Rep, FormError.rep_id == Rep.id)
+        .join(Set, Rep.set_id == Set.id)
+        .join(Workout, Set.workout_id == Workout.id)
+        .where(Workout.user_id == user_id)
+        .group_by(FormError.error_code)
+        .order_by(func.count(FormError.id).desc())
+        .limit(8)
+    )
+    return [ErrorCount(error_code=code, count=n) for code, n in db.execute(stmt).all()]
+
+
+class TempoHistoryPoint(BaseModel):
+    session_id: int
+    date: datetime
+    eccentric_s: float | None
+    isometric_s: float | None
+    concentric_s: float | None
+
+
+@app.get("/users/{user_id}/tempo-history", response_model=list[TempoHistoryPoint])
+def tempo_history(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TempoHistoryPoint]:
+    """Per-session average tempo phase durations, for the tempo chart."""
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Cannot read another user's data")
+    stmt = (
+        select(
+            Workout.id,
+            Workout.started_at,
+            func.avg(Rep.tempo_eccentric_s),
+            func.avg(Rep.tempo_isometric_s),
+            func.avg(Rep.tempo_concentric_s),
+        )
+        .select_from(Workout)
+        .join(Set, Set.workout_id == Workout.id)
+        .join(Rep, Rep.set_id == Set.id)
+        .where(Workout.user_id == user_id)
+        .group_by(Workout.id, Workout.started_at)
+        .order_by(Workout.started_at)
+    )
+    out = []
+    for sid, date, ecc, iso, con in db.execute(stmt).all():
+        out.append(TempoHistoryPoint(
+            session_id=sid, date=date,
+            eccentric_s=float(ecc) if ecc is not None else None,
+            isometric_s=float(iso) if iso is not None else None,
+            concentric_s=float(con) if con is not None else None,
+        ))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # WebSocket — live pose stream (see docs/websocket_schema.md)
 # --------------------------------------------------------------------------- #
 manager = ConnectionManager()
@@ -532,6 +632,50 @@ def build_frame_message(data: dict) -> dict:
         # [{code, message, muscle, severity}] — Phase 7 compensation signatures.
         "compensation_events": data.get("compensation_events", []),
     }
+
+
+def _load_signature(sess, user_id):
+    """Load this user's stored movement-signature baseline into the live session
+    (if one exists). Opens its own short-lived DB session — the WS connection is
+    long-lived, so we don't hold a request-scoped session open for it."""
+    with SessionLocal() as db:
+        row = db.scalar(
+            select(MovementSignature).where(
+                MovementSignature.user_id == user_id,
+                MovementSignature.exercise == sess.exercise,
+            )
+        )
+        sess.signature.user_id = user_id
+        if row is not None and row.baseline_trajectory:
+            sess.signature.load_row({
+                "baseline_trajectory": row.baseline_trajectory,
+                "baseline_variability": row.baseline_variability,
+            })
+
+
+def _save_signature(sess, user_id):
+    """Upsert the freshly-computed baseline into movement_signatures."""
+    payload = sess.signature.to_row()
+    with SessionLocal() as db:
+        row = db.scalar(
+            select(MovementSignature).where(
+                MovementSignature.user_id == user_id,
+                MovementSignature.exercise == sess.exercise,
+            )
+        )
+        if row is None:
+            db.add(MovementSignature(
+                user_id=user_id, exercise=sess.exercise,
+                baseline_trajectory=payload["baseline_trajectory"],
+                baseline_variability=payload["baseline_variability"],
+                sample_count=payload["sample_count"],
+            ))
+        else:
+            row.baseline_trajectory = payload["baseline_trajectory"]
+            row.baseline_variability = payload["baseline_variability"]
+            row.sample_count = payload["sample_count"]
+            row.updated_at = datetime.now(timezone.utc)
+        db.commit()
 
 
 @app.websocket("/ws/{session_id}")
@@ -567,6 +711,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             frame_b64 = data.get("frame")
             if frame_b64:
+                exercise = data.get("exercise", "squat")
+                user_id = data.get("user_id")
+                # First frame for this session? (created lazily in process_frame)
+                first_frame = get_processing_session(session_id) is None
+
                 # Real webcam frame from the browser: run the pose pipeline off
                 # the event loop on the bounded FRAME_EXECUTOR (capped at 4
                 # workers) so many simultaneous sessions can't spawn unbounded
@@ -574,8 +723,22 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(
                     FRAME_EXECUTOR, process_frame, session_id, frame_b64,
-                    data.get("exercise", "squat"),
+                    exercise, user_id,
                 )
+
+                # --- signature persistence (the WS handler's DB-handle points) ---
+                sess = get_processing_session(session_id)
+                if sess is not None and user_id is not None:
+                    # On session start: load the user's existing baseline (if any)
+                    # right after the session is created on its first frame.
+                    if first_frame:
+                        _load_signature(sess, user_id)
+                    # When compute_baseline() just produced a fresh baseline,
+                    # persist it and clear the flag.
+                    if sess.signature_needs_save:
+                        _save_signature(sess, user_id)
+                        sess.signature_needs_save = False
+
                 await websocket.send_text(json.dumps(result))
             else:
                 # No image (e.g. the test client): echo a schema-shaped message.

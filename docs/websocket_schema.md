@@ -69,6 +69,8 @@ per session; the server tracks it in `ConnectionManager`.
 | `asymmetry` | object \| null | `{ai_pct, dominant_side, risk}` — bilateral AI for the last rep | Phase 6 |
 | `tempo` | object \| null | `{phase, eccentric_s, isometric_s, concentric_s, eccentric_ok, concentric_ok}` | Phase 6 |
 | `compensation_events` | array | `[{code, message, muscle, severity}]` — Phase 7 multi-joint signatures | Phase 7 |
+| `fatigue` | object \| null | `{code, severity, slope, message}` — within-set form decline | Phase 8 |
+| `signature` | object \| null | `{code, distance, threshold, message}` — DTW deviation from personal baseline | Phase 8 |
 
 `asymmetry.risk` is `"OK"` / `"WARNING"` / `"HIGH"`; `dominant_side` is
 `"left"` / `"right"` / `"none"`. `tempo.phase` is the current phase name.

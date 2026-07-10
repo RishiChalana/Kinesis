@@ -1,0 +1,58 @@
+.app { min-height: 100vh; background: #0e0e11; color: #f2f2f2; font-family: system-ui, sans-serif; }
+
+.topnav {
+  display: flex; align-items: center; gap: 18px;
+  padding: 12px 18px; background: #16161a; border-bottom: 1px solid #262630;
+}
+.topnav .brand { font-weight: 800; letter-spacing: 3px; }
+.topnav a { color: #9aa; text-decoration: none; font-weight: 600; }
+.topnav a.active { color: #28e07a; }
+.topnav .spacer { flex: 1; }
+
+.authbar { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #9aa; }
+.authbar input {
+  background: #1b1b20; color: #f2f2f2; border: 1px solid #333;
+  border-radius: 6px; padding: 5px 8px; width: 120px;
+}
+.link-btn { background: none; border: none; color: #28e07a; cursor: pointer; font-weight: 700; }
+.authed-dot { width: 9px; height: 9px; border-radius: 50%; background: #28e07a; display: inline-block; }
+.auth-err { color: #ef4444; }
+
+.page { padding: 24px; }
+.page h1 { margin-top: 0; }
+.page .err { color: #ef4444; }
+
+.chart-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 20px;
+}
+.chart-card { background: #16161a; border: 1px solid #262630; border-radius: 12px; padding: 16px; }
+.chart-card h3 { margin: 0 0 12px; font-size: 16px; }
+.chart-card .hint { color: #667; font-weight: 400; font-size: 12px; }
+
+.history-table { width: 100%; border-collapse: collapse; }
+.history-table th, .history-table td {
+  text-align: left; padding: 10px 12px; border-bottom: 1px solid #262630;
+}
+.history-table a { color: #28e07a; text-decoration: none; }
+
+.rep-tooltip {
+  background: #1b1b20; border: 1px solid #333; border-radius: 8px; padding: 8px 10px; font-size: 13px;
+}
+.rep-detail { margin-top: 8px; color: #f59e0b; font-weight: 600; }
+
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+}
+.modal {
+  position: relative; background: #16161a; border: 1px solid #333; border-radius: 12px;
+  padding: 24px 28px; width: 440px; max-width: 92vw; max-height: 86vh; overflow: auto;
+}
+.modal-close {
+  position: absolute; top: 10px; right: 14px; background: none; border: none;
+  color: #9aa; font-size: 26px; cursor: pointer; line-height: 1;
+}
+.modal h2 { margin: 0 0 8px; color: #ef4444; }
+.modal h4 { margin: 16px 0 6px; color: #28e07a; }
+.modal-cause { color: #ddd; }
+.modal-ref { margin-top: 16px; color: #778; font-size: 13px; font-style: italic; }

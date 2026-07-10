@@ -13,7 +13,16 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -104,6 +113,7 @@ class Rep(Base):
     form_score: Mapped[float | None] = mapped_column(Float)
     tempo_eccentric_s: Mapped[float | None] = mapped_column(Float)
     tempo_concentric_s: Mapped[float | None] = mapped_column(Float)
+    tempo_isometric_s: Mapped[float | None] = mapped_column(Float)  # Phase 8
     left_asymmetry: Mapped[float | None] = mapped_column(Float)
     right_asymmetry: Mapped[float | None] = mapped_column(Float)
     compensation_detected: Mapped[bool | None] = mapped_column(Boolean)
@@ -151,3 +161,20 @@ class LandmarkFrame(Base):
     x_norm: Mapped[float | None] = mapped_column(Float)
     y_norm: Mapped[float | None] = mapped_column(Float)
     visibility: Mapped[float | None] = mapped_column(Float)
+
+
+class MovementSignature(Base):
+    """Phase 8 — a user's personal kinematic fingerprint for one exercise.
+    baseline_trajectory is the mean 50-point angle trajectory stored as JSON."""
+
+    __tablename__ = "movement_signatures"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    exercise: Mapped[str] = mapped_column(String, nullable=False)
+    baseline_trajectory: Mapped[list | None] = mapped_column(JSON)
+    baseline_variability: Mapped[float | None] = mapped_column(Float)
+    sample_count: Mapped[int | None] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

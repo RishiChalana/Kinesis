@@ -26,8 +26,10 @@ import numpy as np
 from ml.angles import calculate_angle
 from ml.asymmetry import AsymmetryAnalyser
 from ml.compensation import CompensationDetector
+from ml.fatigue import FatigueDetector
 from ml.pose import extract_landmarks
 from ml.rep_counter import RepCounter
+from ml.signature import RepTrajectory, SignatureModel
 from ml.tempo import TempoAnalyser
 
 mp_pose = mp.solutions.pose
@@ -84,14 +86,23 @@ class ProcessingSession:
         self.asymmetry = AsymmetryAnalyser(self.exercise)
         self.tempo = TempoAnalyser()
         self.compensation = CompensationDetector(self.exercise)
+        self.fatigue = FatigueDetector()
+        self.signature = SignatureModel(user_id=None, exercise=self.exercise)
 
         self.frame_id = 0
         self.prev_state = self.counter.state
         self._bottom_left = None
         self._bottom_right = None
+        self._rep_trajectory = None
         self.last_asymmetry = None
         self.last_tempo = None
+        self.last_form_score = None
+        self.last_fatigue = None
+        self.last_signature = None
         self.missed_frames = 0
+        # Set True when a fresh baseline is computed and needs persisting; the
+        # WS handler reads this, saves to movement_signatures, and clears it.
+        self.signature_needs_save = False
 
     def process(self, frame_bgr):
         """Run pose on a decoded BGR frame, then process the landmarks. The
@@ -136,10 +147,13 @@ class ProcessingSession:
             completed = self.counter.update(left_angle, self.frame_id)
             if self.prev_state == "UP" and self.counter.state == "DOWN":
                 self.tempo.start_rep()
+                self._rep_trajectory = RepTrajectory()
                 self._bottom_left = None
                 self._bottom_right = None
             if self.counter.state == "DOWN":
                 self.tempo.observe(left_angle, now)
+                if self._rep_trajectory is not None:
+                    self._rep_trajectory.add(left_angle, now)
                 if self._bottom_left is None or left_angle < self._bottom_left:
                     self._bottom_left = left_angle
                     self._bottom_right = right_angle
@@ -156,18 +170,20 @@ class ProcessingSession:
             "timestamp": time.time(),
             "rep_count": self.counter.count,
             "state": "TRACKING_LOST" if tracking_lost else self.counter.state,
-            "form_score": None,
             "active_errors": [],
             "landmarks": [
                 {"id": lm["id"], "x_norm": lm["x_norm"], "y_norm": lm["y_norm"],
                  "visibility": lm["visibility"]}
                 for lm in landmarks
             ],
+            "form_score": self.last_form_score,
             "left_angle": left_angle,
             "right_angle": right_angle,
             "asymmetry": self.last_asymmetry,
             "tempo": self.last_tempo,
             "compensation_events": compensation_events,
+            "fatigue": self.last_fatigue,
+            "signature": self.last_signature,
         }
 
     def _on_rep_complete(self, compensation_events):
@@ -190,7 +206,44 @@ class ProcessingSession:
                 "eccentric_ok": scored.get("eccentric"),
                 "concentric_ok": scored.get("concentric"),
             }
-        compensation_events.extend(self.compensation.analyse_rep_complete())
+        # Compensation (inter-rep trend signatures) — every-frame update already ran.
+        rep_comp_events = self.compensation.analyse_rep_complete()
+        compensation_events.extend(rep_comp_events)
+
+        # Lightweight form score (interim stand-in for a full FormChecker):
+        # start at 100, deduct for asymmetry risk, off-target tempo, compensation.
+        self.last_form_score = self._score_rep(rep_comp_events, compensation_events)
+
+        # Fatigue: append this rep's score, read the within-set slope.
+        self.last_fatigue = self.fatigue.add(self.last_form_score)
+
+        # Movement signature: build the rep trajectory, keep it if it's a good
+        # rep, and compare against the personal baseline once one exists.
+        traj = self._rep_trajectory.normalise() if self._rep_trajectory else None
+        if traj is not None:
+            self.signature.add_good_rep(traj, self.last_form_score)
+            # Build a fresh baseline only if we don't already have one (a loaded
+            # baseline is kept, not overwritten). Flag it for the WS handler to
+            # persist the first time it's successfully computed.
+            if self.signature.baseline_mean is None:
+                if self.signature.compute_baseline():
+                    self.signature_needs_save = True
+            self.last_signature = self.signature.compare(traj)
+        self._rep_trajectory = None
+
+    def _score_rep(self, rep_comp_events, all_comp_events):
+        score = 100.0
+        if self.last_asymmetry:
+            risk = self.last_asymmetry["risk"]
+            score -= 10 if risk == "WARNING" else 25 if risk == "HIGH" else 0
+        if self.last_tempo:
+            if self.last_tempo.get("eccentric_ok") is False:
+                score -= 10
+            if self.last_tempo.get("concentric_ok") is False:
+                score -= 10
+        if all_comp_events:
+            score -= 20
+        return max(0.0, min(100.0, score))
 
     def close(self):
         self.pose.close()
@@ -199,11 +252,18 @@ class ProcessingSession:
 _sessions: dict[str, ProcessingSession] = {}
 
 
-def process_frame(session_id, frame_b64, exercise="squat"):
+def get_processing_session(session_id):
+    """Return the live ProcessingSession for a WS session_id, or None. Lets the
+    WS handler (which holds the DB) inspect/persist the signature model."""
+    return _sessions.get(session_id)
+
+
+def process_frame(session_id, frame_b64, exercise="squat", user_id=None):
     """Decode + process one frame for a session. Returns a frame message dict."""
     sess = _sessions.get(session_id)
     if sess is None:
         sess = ProcessingSession(exercise)
+        sess.signature.user_id = user_id
         _sessions[session_id] = sess
     frame = _decode(frame_b64)
     if frame is None:

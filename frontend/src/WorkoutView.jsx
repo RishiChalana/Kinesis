@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import AlertStack from "./components/AlertStack";
 import RepCounter from "./components/RepCounter";
+import { getUserId } from "./api";
 import { drawSkeleton } from "./skeleton";
 import "./WorkoutView.css";
 
@@ -112,7 +113,13 @@ export default function WorkoutView() {
         const ctx = c.getContext("2d");
         ctx.drawImage(video, 0, 0, c.width, c.height);
         const b64 = c.toDataURL("image/jpeg", 0.6);
-        ws.send(JSON.stringify({ frame: b64, session_id: sessionId, exercise }));
+        // user_id (when logged in) lets the backend load/save the movement
+        // signature baseline for this user+exercise.
+        const uid = getUserId();
+        ws.send(JSON.stringify({
+          frame: b64, session_id: sessionId, exercise,
+          user_id: uid ? Number(uid) : null,
+        }));
       }
     }
     rafRef.current = requestAnimationFrame(loop);
