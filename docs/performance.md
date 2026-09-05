@@ -135,3 +135,102 @@ small. Persistence is lossless in all cases (2,970 rows/session = 90 × 33).
 
 Reproduce (server running): concurrent WS load harness, 8 sessions × 90 frames,
 comparing HEAD (naive-sync) vs the offloaded variant.
+
+---
+
+## 6. Parallel Cassandra dual-write — executor-pool contention and its fix
+
+The parallel Cassandra writer (dual-write alongside TimescaleDB, sharing
+`LandmarkBuffer`'s flush cadence) first ran its flush on the **shared**
+`FRAME_EXECUTOR` (4 workers, also serving MediaPipe `process_frame`). A flush
+holds its worker for tens of ms; on the shared pool that stole inference slots
+and throttled every session's fps. The fix (option 2) moves flushes to a
+**dedicated** `FLUSH_EXECUTOR` (2 threads), leaving MediaPipe all 4 workers.
+
+Three configs, **8 concurrent WS sessions × 90 real frames**, 3× each, measured
+both before and after the fix:
+
+  * **A** — TimescaleDB only
+  * **B** — Cassandra only (TS write skipped, to isolate the store)
+  * **C** — Dual-write (both, as shipped)
+
+**Combined per-session fps (median of 3):**
+
+| Config | Pre-fix (shared pool) | Post-fix (dedicated pool) | Δ |
+|--------|----------------------:|--------------------------:|:--|
+| A — TimescaleDB only | 21.2 | **23.9** | +13% |
+| B — Cassandra only   | 15.8 | **17.8** | +13% |
+| C — Dual-write       | 14.3 | **12.9** | flat (within noise) |
+
+**Per-store write latency & throughput (per 330-row flush, under load):**
+
+| Config | Store | p50 pre → post | p95 pre → post | throughput pre → post |
+|--------|-------|---------------:|---------------:|----------------------:|
+| A | TimescaleDB | 19–21 → **18–20 ms** | 31–47 → **26–29 ms** | 13.5–17k → **16–17.5k rows/s** |
+| B | Cassandra   | 74–80 → **43–53 ms** | 152–241 → **100–117 ms** | 3.4–3.8k → **5.6–6.9k rows/s** |
+| C | TimescaleDB | 28–34 → **23 ms** | 98–341 → **33–81 ms** | 5–9k → **10.7–14k rows/s** |
+| C | Cassandra   | 55–71 → **41–45 ms** | 129–341 → **115–244 ms** | 3.7–5k → **4.5–5.9k rows/s** |
+
+**Frame drop: 0.00% in all 18 runs. Dual-write parity: exact (TimescaleDB ==
+Cassandra == 2,970 rows/session) both pre- and post-fix.**
+
+**Conclusion:**
+
+1. **The fix works for the pool-contention case.** TS-only and Cassandra-only fps
+   both rose ~13%, and — more strikingly — Cassandra write throughput nearly
+   doubled (3.5k → 6.5k rows/s) with p50 latency down ~40% (75 → 44 ms).
+   Mechanism: on the shared pool, the Cassandra driver's worker thread competed
+   with CPU-heavy MediaPipe inference for the same 4 threads, starving the
+   async-callback processing; on a dedicated pool it gets CPU promptly. Same
+   reason TS p95 tightened. This is the coupling problem and its fix, cleanly
+   demonstrated.
+
+2. **Dual-write live fps did *not* improve (~13–14 either way).** This is the
+   honest, interesting part: in dual mode the flush is ~65–90 ms (TS + Cassandra
+   sequential) and it is **awaited in each session's request→response critical
+   path** on every 10th frame. That latency serializes into the session's own
+   throughput regardless of which pool runs it, so freeing MediaPipe doesn't move
+   it. It's a **latency-in-critical-path** problem, not a pool-contention one — a
+   different bottleneck that option 2 isn't designed to solve.
+
+3. So option 2 is the right fix for the specific coupling identified (and it
+   measurably improved per-store throughput and the single-store live paths), but
+   it exposes that dual-write's live-fps ceiling is Cassandra's critical-path
+   write latency. The lever for that is fire-and-forget Cassandra writes — see
+   Future Work.
+
+Per-store numbers are why Cassandra costs more per flush than TimescaleDB in the
+first place: TimescaleDB writes 330 rows in one `bulk_insert_mappings`; Cassandra
+issues 330 individual async `LOCAL_ONE` inserts (each landmark is its own
+partition, so batching cannot help). That is inherent to the schema/access
+pattern, not a tuning miss.
+
+Reproduce (both stores running): the A/B/C driver — instrumented server
+(monkeypatched flush per `BENCH_MODE`) + 8-session × 90-frame harness, `/bench/stats`
+for per-store flush timing.
+
+---
+
+## Future Work — fire-and-forget Cassandra writes (option 3, not implemented)
+
+Finding 2 above shows dual-write's live-fps ceiling is Cassandra's ~50–70 ms
+flush sitting in each session's awaited critical path. Option 3 would remove it:
+after the TimescaleDB commit (source of truth), hand the rows to a bounded queue
+drained by a dedicated Cassandra writer thread and return immediately, instead of
+awaiting the Cassandra write. The flush's critical-path cost would drop back to
+TimescaleDB-only (~20 ms).
+
+**Deliberately not implemented**, because the tradeoff is real and unresolved:
+
+* **Backpressure.** Awaiting the write gives natural backpressure — a slow
+  Cassandra slows the producer. Fire-and-forget removes it: if Cassandra lags,
+  the queue grows and must be bounded, forcing a policy choice (drop telemetry vs
+  block anyway vs unbounded memory).
+* **Observability.** Awaiting surfaces write failures at flush time (logged
+  per session). Fire-and-forget decouples the failure from the request, so
+  divergence between the stores becomes silent — it needs separate monitoring
+  (queue depth, write error rate, periodic parity checks) to stay trustworthy.
+
+Given Cassandra here is a best-effort *mirror* (TimescaleDB is authoritative),
+fire-and-forget is defensible — but only with those two mechanisms in place.
+Documented as a decision to make explicitly, not to slip in silently.
