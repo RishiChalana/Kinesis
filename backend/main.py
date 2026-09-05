@@ -40,6 +40,7 @@ from backend.frame_processor import (
     get_processing_session,
     process_frame,
 )
+from backend.landmark_store import LandmarkBuffer
 from backend.landmarks import resolve_landmark
 from backend.models import (
     FormError,
@@ -621,6 +622,38 @@ def tempo_history(
 # --------------------------------------------------------------------------- #
 manager = ConnectionManager()
 
+# Per-WS-session landmark buffers. Each accumulates 33 rows/frame and flushes a
+# batch to the landmark_frames hypertable every FLUSH_EVERY_FRAMES frames — the
+# same write path exercised by test_phase6_timescale.py / bench_performance.py,
+# now wired into the live stream. Keyed by the WS session_id (the workout id).
+_landmark_buffers: dict[str, LandmarkBuffer] = {}
+
+
+def _persist_landmarks(session_id: str, frame_id, landmarks: list[dict]) -> None:
+    """Buffer one frame's landmarks and flush a batch when the threshold is hit.
+    A flush opens its own short-lived DB session (the WS connection is
+    long-lived), mirroring the signature-persistence pattern below. Frames with
+    no landmarks (no person tracked) buffer nothing but still count toward the
+    flush cadence, exactly as LandmarkBuffer is designed."""
+    if frame_id is None:
+        return
+    buf = _landmark_buffers.get(session_id)
+    if buf is None:
+        buf = LandmarkBuffer(session_id=int(session_id))
+        _landmark_buffers[session_id] = buf
+    buf.add_frame(frame_id, landmarks)
+    if buf.should_flush():
+        with SessionLocal() as db:
+            buf.flush(db)
+
+
+def _close_landmarks(session_id: str) -> None:
+    """Flush any remaining buffered rows and drop the buffer on disconnect."""
+    buf = _landmark_buffers.pop(session_id, None)
+    if buf is not None:
+        with SessionLocal() as db:
+            buf.flush(db)
+
 
 def build_frame_message(data: dict) -> dict:
     """Build an outgoing frame message per docs/websocket_schema.md. The CV
@@ -727,6 +760,7 @@ async def websocket_endpoint(
                 except asyncio.TimeoutError:
                     await websocket.close(code=status.WS_1001_GOING_AWAY)
                     manager.disconnect(session_id)
+                    _close_landmarks(session_id)
                     return
 
             try:
@@ -769,6 +803,13 @@ async def websocket_endpoint(
                         _save_signature(sess, user_id)
                         sess.signature_needs_save = False
 
+                # Persist this frame's raw landmarks to the TimescaleDB
+                # hypertable (batched; flushes every FLUSH_EVERY_FRAMES frames).
+                _persist_landmarks(
+                    session_id, result.get("frame_id"),
+                    result.get("landmarks", []),
+                )
+
                 await websocket.send_text(json.dumps(result))
             else:
                 # No image (e.g. the test client): echo a schema-shaped message.
@@ -776,3 +817,4 @@ async def websocket_endpoint(
     except WebSocketDisconnect:
         manager.disconnect(session_id)
         close_session(session_id)
+        _close_landmarks(session_id)
