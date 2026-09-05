@@ -629,12 +629,21 @@ manager = ConnectionManager()
 _landmark_buffers: dict[str, LandmarkBuffer] = {}
 
 
-def _persist_landmarks(session_id: str, frame_id, landmarks: list[dict]) -> None:
+def _flush_buffer(buf: LandmarkBuffer) -> None:
+    """Blocking flush — opens a short-lived DB session and bulk-inserts. Runs on
+    FRAME_EXECUTOR (off the event loop), never inline in the coroutine."""
+    with SessionLocal() as db:
+        buf.flush(db)
+
+
+async def _persist_landmarks(session_id: str, frame_id, landmarks: list[dict]) -> None:
     """Buffer one frame's landmarks and flush a batch when the threshold is hit.
-    A flush opens its own short-lived DB session (the WS connection is
-    long-lived), mirroring the signature-persistence pattern below. Frames with
-    no landmarks (no person tracked) buffer nothing but still count toward the
-    flush cadence, exactly as LandmarkBuffer is designed."""
+    The flush's DB I/O is offloaded to FRAME_EXECUTOR so it never blocks the
+    single asyncio event loop (a synchronous flush here stalls every concurrent
+    session; see docs/performance.md). Awaiting keeps this session's flushes
+    ordered and the buffer single-threaded — add_frame never runs concurrently
+    with a flush for the same buffer. Frames with no landmarks (no person
+    tracked) buffer nothing but still count toward the flush cadence."""
     if frame_id is None:
         return
     buf = _landmark_buffers.get(session_id)
@@ -643,8 +652,8 @@ def _persist_landmarks(session_id: str, frame_id, landmarks: list[dict]) -> None
         _landmark_buffers[session_id] = buf
     buf.add_frame(frame_id, landmarks)
     if buf.should_flush():
-        with SessionLocal() as db:
-            buf.flush(db)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(FRAME_EXECUTOR, _flush_buffer, buf)
 
 
 def _close_landmarks(session_id: str) -> None:
@@ -805,7 +814,7 @@ async def websocket_endpoint(
 
                 # Persist this frame's raw landmarks to the TimescaleDB
                 # hypertable (batched; flushes every FLUSH_EVERY_FRAMES frames).
-                _persist_landmarks(
+                await _persist_landmarks(
                     session_id, result.get("frame_id"),
                     result.get("landmarks", []),
                 )

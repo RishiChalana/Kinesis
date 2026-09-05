@@ -92,3 +92,46 @@ Reproduce: `python backend/bench_performance.py`
   **0.9 KB** (tracemalloc before/after) — no leak.
 
 Reproduce (server running): `python backend/test_ws_stability.py`
+
+---
+
+## 5. Landmark-persistence wiring — synchronous vs offloaded flush
+
+When the live WS path was wired to persist landmarks (`_persist_landmarks` →
+`LandmarkBuffer`), the batched flush every 10 frames does DB I/O. Because the WS
+handler runs on the single asyncio event loop, an **inline** flush blocks *every*
+concurrent session for the duration of the insert. Measured isolated flush cost
+(SessionLocal open + 330-row `bulk_insert_mappings` + commit): **9.6 ms median /
+18.3 ms p95 / 109 ms max**.
+
+**A note on method, kept deliberately:** the *first* A/B (single run per config)
+appeared to show a ~15–18% fps regression from the synchronous flush. That was
+**measurement noise** — the wired run happened to include a 109 ms flush outlier
+(checkpoint/GC/thermal) that dragged its single-run median. Re-running **3× per
+config** to replicate, the regression did **not** hold: baseline and naive-sync
+are statistically indistinguishable. Lesson: single-run fps numbers on this
+hardware are noise; replicate before characterizing a regression.
+
+Load test: **8 concurrent WS sessions × 90 real frames** (drawn-figure JPEGs so
+MediaPipe emits 33 landmarks/frame → genuine inserts every 10 frames). Per-session
+fps across 3 runs each:
+
+| Config | Run 1 | Run 2 | Run 3 | Median fps/session | Aggregate (median) | Frame drop |
+|--------|------:|------:|------:|-------------------:|-------------------:|:----------:|
+| No wiring (baseline)      | 19.5 | 23.6 | 18.9 | **19.5** | ~156 | **0.00%** |
+| Naive-sync wiring         | 19.6 | 20.6 | 20.6 | **20.6** | ~165 | **0.00%** |
+| Offloaded wiring          | 22.3 | 22.6 | 23.3 | **22.6** | ~181 | **0.00%** |
+
+**0% frame drop in every config and every run.** (Harness caveat: it does
+sequential send/recv per client, which self-throttles — a flush stall delays a
+response rather than dropping a frame; a flooding client would stress latency
+harder.)
+
+**Conclusion:** the offloaded flush
+(`await loop.run_in_executor(FRAME_EXECUTOR, _flush_buffer, buf)`) is the
+strongest and most consistent — highest median, tightest spread — and it removes
+the event-loop-blocking flush as a category rather than relying on it staying
+small. Persistence is lossless in all cases (2,970 rows/session = 90 × 33).
+
+Reproduce (server running): concurrent WS load harness, 8 sessions × 90 frames,
+comparing HEAD (naive-sync) vs the offloaded variant.
