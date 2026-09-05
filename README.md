@@ -49,6 +49,10 @@ The diagram should show the end-to-end flow:
 - **PostgreSQL + TimescaleDB**: relational tables (users, workouts, sets, reps,
   form_errors, user_profiles, movement_signatures) + a **hypertable** for raw
   landmark time-series (compressed after 7 days, retained 90).
+- **Cassandra (optional, off by default)**: a parallel landmark-telemetry writer
+  that dual-writes the same time-series alongside TimescaleDB (TimescaleDB stays
+  the source of truth). Gated behind `CASSANDRA_ENABLED`; see Quick setup and
+  `docs/performance.md` §6.
 - **Dashboard** reads aggregates for trend / asymmetry / tempo / error charts.
 
 ---
@@ -66,6 +70,7 @@ The diagram should show the end-to-end flow:
 | Auth | JWT (python-jose), passlib/bcrypt |
 | ORM / migrations | SQLAlchemy 2.0, Alembic |
 | Time-series storage | PostgreSQL + TimescaleDB (hypertable) |
+| Parallel telemetry store (optional) | Cassandra (dual-write, off by default) |
 | Frontend | React, Vite, React Router |
 | Charts | Recharts |
 | Containerisation | Docker, Docker Compose, nginx |
@@ -84,11 +89,20 @@ The diagram should show the end-to-end flow:
 docker-compose up --build
 ```
 
-This starts three services: **TimescaleDB**, the **FastAPI backend** (runs
+This starts four services: **TimescaleDB**, a single-node **Cassandra** (dev/bench
+only — inert unless dual-write is enabled), the **FastAPI backend** (runs
 migrations then serves on `:8000`), and the **nginx-served React app** (`:80`).
 
 - App: http://localhost
 - API docs: http://localhost:8000/docs
+
+**Optional — parallel Cassandra dual-write.** Off by default. To turn it on, set
+`CASSANDRA_ENABLED=true` in `.env` (and `CASSANDRA_CONTACT_POINTS=cassandra` when
+running under Docker Compose; the other `CASSANDRA_*` defaults in `.env.example`
+work as-is). The backend then mirrors raw landmark time-series into Cassandra
+alongside TimescaleDB. It's best-effort: a Cassandra outage is logged and
+swallowed, never breaking the primary TimescaleDB write. See `docs/performance.md`
+§6 for the schema, consistency levels, retention, and dual-write benchmarks.
 
 **Local dev without Docker:** see `docs/SETUP.md` (Python 3.12 venv + `uvicorn
 backend.main:app --reload`, and `cd frontend && npm run dev`).
@@ -124,7 +138,8 @@ resistance-training / tempo guidance — see `docs/METHODOLOGY.md`.)
 ## Documentation
 
 - `docs/METHODOLOGY.md` — the calibration/compensation/DTW/asymmetry math with citations
-- `docs/performance.md` — measured benchmark numbers (indexes, bulk insert, throughput)
+- `docs/performance.md` — measured benchmark numbers (indexes, bulk insert, MediaPipe
+  throughput, WS stability, and the Cassandra dual-write / executor-pool-contention study)
 - `docs/security_audit.md` — auth / CORS / WS-token audit
 - `docs/privacy_notes.md` — why raw video frames are never persisted
 - `docs/timescale_policy.md` — compression & retention rationale

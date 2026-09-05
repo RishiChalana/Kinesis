@@ -133,6 +133,10 @@ strongest and most consistent — highest median, tightest spread — and it rem
 the event-loop-blocking flush as a category rather than relying on it staying
 small. Persistence is lossless in all cases (2,970 rows/session = 90 × 33).
 
+> **Note:** this section describes the state at the offload commit, when the flush
+> ran on the shared `FRAME_EXECUTOR`. It was later moved to a dedicated
+> `FLUSH_EXECUTOR` — see §6 for the current behavior and why.
+
 Reproduce (server running): concurrent WS load harness, 8 sessions × 90 frames,
 comparing HEAD (naive-sync) vs the offloaded variant.
 
