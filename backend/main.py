@@ -8,6 +8,8 @@ user_id from the token, never from the request body.
 import asyncio
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import (
@@ -31,6 +33,7 @@ from backend.auth import (
     hash_password,
     verify_password,
 )
+from backend.cassandra_store import close_cassandra_writer, get_cassandra_writer
 from backend.connection_manager import ConnectionManager
 from backend.correctives import CORRECTIVES, get_corrective
 from backend.database import SessionLocal, get_db
@@ -57,7 +60,17 @@ from backend.models import (
 HEARTBEAT_IDLE_SECONDS = 10.0
 HEARTBEAT_PONG_TIMEOUT_SECONDS = 5.0
 
-app = FastAPI(title="KINESIS")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Warm the parallel Cassandra writer once at startup (no-op unless
+    # CASSANDRA_ENABLED) so no WS frame pays cluster-connect latency on the
+    # event loop; the dual-write itself runs on FLUSH_EXECUTOR during flushes.
+    get_cassandra_writer()
+    yield
+    close_cassandra_writer()
+
+
+app = FastAPI(title="KINESIS", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -628,32 +641,44 @@ manager = ConnectionManager()
 # now wired into the live stream. Keyed by the WS session_id (the workout id).
 _landmark_buffers: dict[str, LandmarkBuffer] = {}
 
+# Flushes run on their OWN small pool, not FRAME_EXECUTOR. A flush (TS bulk
+# insert + optional Cassandra dual-write) holds its worker for tens of ms; on the
+# shared MediaPipe pool that stole inference slots and throttled every session's
+# fps (see docs/performance.md §5). A dedicated pool lets MediaPipe keep all 4
+# workers. 2 threads: flushes are I/O-bound and low-frequency (~2/session/s), and
+# per-session ordering is preserved because each session awaits its own flush.
+FLUSH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="lm-flush")
+
 
 def _flush_buffer(buf: LandmarkBuffer) -> None:
     """Blocking flush — opens a short-lived DB session and bulk-inserts. Runs on
-    FRAME_EXECUTOR (off the event loop), never inline in the coroutine."""
+    FLUSH_EXECUTOR (off the event loop), never inline in the coroutine."""
     with SessionLocal() as db:
         buf.flush(db)
 
 
 async def _persist_landmarks(session_id: str, frame_id, landmarks: list[dict]) -> None:
     """Buffer one frame's landmarks and flush a batch when the threshold is hit.
-    The flush's DB I/O is offloaded to FRAME_EXECUTOR so it never blocks the
+    The flush's DB I/O is offloaded to FLUSH_EXECUTOR so it never blocks the
     single asyncio event loop (a synchronous flush here stalls every concurrent
-    session; see docs/performance.md). Awaiting keeps this session's flushes
-    ordered and the buffer single-threaded — add_frame never runs concurrently
-    with a flush for the same buffer. Frames with no landmarks (no person
-    tracked) buffer nothing but still count toward the flush cadence."""
+    session; see docs/performance.md) and never competes with MediaPipe for
+    FRAME_EXECUTOR. Awaiting keeps this session's flushes ordered and the buffer
+    single-threaded — add_frame never runs concurrently with a flush for the same
+    buffer. Frames with no landmarks (no person tracked) buffer nothing but still
+    count toward the flush cadence."""
     if frame_id is None:
         return
     buf = _landmark_buffers.get(session_id)
     if buf is None:
-        buf = LandmarkBuffer(session_id=int(session_id))
+        # get_cassandra_writer() returns the warmed singleton (or None when
+        # dual-write is disabled) — cheap here, no connect on the event loop.
+        buf = LandmarkBuffer(
+            session_id=int(session_id), cassandra_writer=get_cassandra_writer())
         _landmark_buffers[session_id] = buf
     buf.add_frame(frame_id, landmarks)
     if buf.should_flush():
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(FRAME_EXECUTOR, _flush_buffer, buf)
+        await loop.run_in_executor(FLUSH_EXECUTOR, _flush_buffer, buf)
 
 
 def _close_landmarks(session_id: str) -> None:

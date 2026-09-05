@@ -5,19 +5,30 @@ DB. LandmarkBuffer accumulates 33 rows per frame and flushes with a single
 bulk_insert_mappings() every FLUSH_EVERY_FRAMES frames, cutting round-trips ~10x.
 """
 
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from backend.models import LandmarkFrame
 
+logger = logging.getLogger(__name__)
+
 FLUSH_EVERY_FRAMES = 10
 
 
 class LandmarkBuffer:
-    def __init__(self, session_id: int, flush_every: int = FLUSH_EVERY_FRAMES):
+    def __init__(
+        self,
+        session_id: int,
+        flush_every: int = FLUSH_EVERY_FRAMES,
+        cassandra_writer=None,
+    ):
         self.session_id = session_id
         self.flush_every = flush_every
+        # Optional parallel Cassandra writer (backend.cassandra_store). None ->
+        # TimescaleDB-only, unchanged behaviour. Dual-write shares this cadence.
+        self.cassandra_writer = cassandra_writer
         self._rows: list[dict] = []
         self._frames_since_flush = 0
 
@@ -49,6 +60,16 @@ class LandmarkBuffer:
         n = len(self._rows)
         db.bulk_insert_mappings(LandmarkFrame, self._rows)
         db.commit()
+        # Parallel best-effort dual-write to Cassandra AFTER the primary TS commit
+        # succeeds, on the same rows and cadence. A Cassandra failure is logged
+        # and swallowed — it must never break the source-of-truth write.
+        if self.cassandra_writer is not None:
+            try:
+                self.cassandra_writer.write_landmarks(self._rows)
+            except Exception:
+                logger.warning(
+                    "Cassandra dual-write failed for session %s (%d rows)",
+                    self.session_id, n, exc_info=True)
         self._rows.clear()
         self._frames_since_flush = 0
         return n

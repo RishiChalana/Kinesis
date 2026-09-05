@@ -20,6 +20,22 @@ services:
     networks:
       - kinesis
 
+  # Single-node Cassandra for the parallel landmark-telemetry dual-write.
+  # DEV/BENCH only: default DC is 'datacenter1' (matches CASSANDRA_LOCAL_DC) and
+  # the benchmark keyspace is created at RF=1. 9042 is published so host-side
+  # benchmarks can reach it, same as we do for the db service. The backend does
+  # NOT depend on this — dual-write is best-effort and off unless CASSANDRA_ENABLED.
+  cassandra:
+    image: cassandra:5.0
+    environment:
+      CASSANDRA_CLUSTER_NAME: kinesis
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    networks:
+      - kinesis
+
   backend:
     # amd64 to match the deploy target + the available ML wheels (see Dockerfile).
     platform: linux/amd64
@@ -56,6 +72,7 @@ services:
 
 volumes:
   postgres_data:
+  cassandra_data:
 
 networks:
   kinesis:
