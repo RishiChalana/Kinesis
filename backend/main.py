@@ -74,7 +74,11 @@ app = FastAPI(title="KINESIS", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost",
+        "http://127.0.0.1",
+        "http://localhost:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -492,9 +496,6 @@ def session_detail(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Workout:
-    # selectinload for each nested one-to-many level: one extra SELECT ... IN
-    # per level (workout -> sets -> reps -> form_errors) = constant 4 queries,
-    # never N+1, and no JOIN row-explosion. See explanation in the summary.
     stmt = (
         select(Workout)
         .where(Workout.id == session_id)
@@ -658,20 +659,11 @@ def _flush_buffer(buf: LandmarkBuffer) -> None:
 
 
 async def _persist_landmarks(session_id: str, frame_id, landmarks: list[dict]) -> None:
-    """Buffer one frame's landmarks and flush a batch when the threshold is hit.
-    The flush's DB I/O is offloaded to FLUSH_EXECUTOR so it never blocks the
-    single asyncio event loop (a synchronous flush here stalls every concurrent
-    session; see docs/performance.md) and never competes with MediaPipe for
-    FRAME_EXECUTOR. Awaiting keeps this session's flushes ordered and the buffer
-    single-threaded — add_frame never runs concurrently with a flush for the same
-    buffer. Frames with no landmarks (no person tracked) buffer nothing but still
-    count toward the flush cadence."""
+    """Buffer one frame's landmarks and flush a batch when the threshold is hit."""
     if frame_id is None:
         return
     buf = _landmark_buffers.get(session_id)
     if buf is None:
-        # get_cassandra_writer() returns the warmed singleton (or None when
-        # dual-write is disabled) — cheap here, no connect on the event loop.
         buf = LandmarkBuffer(
             session_id=int(session_id), cassandra_writer=get_cassandra_writer())
         _landmark_buffers[session_id] = buf
@@ -690,9 +682,7 @@ def _close_landmarks(session_id: str) -> None:
 
 
 def build_frame_message(data: dict) -> dict:
-    """Build an outgoing frame message per docs/websocket_schema.md. The CV
-    client supplies the computed values; asymmetry/tempo are nested objects
-    (Phase 6) and may be null on frames where no rep just completed."""
+    """Build an outgoing frame message per docs/websocket_schema.md."""
     return {
         "frame_id": data.get("frame_id"),
         "timestamp": data.get("timestamp", time.time()),
@@ -700,24 +690,16 @@ def build_frame_message(data: dict) -> dict:
         "state": data.get("state", "UP"),
         "form_score": data.get("form_score"),
         "active_errors": data.get("active_errors", []),
-        # [{id, x_norm, y_norm, visibility, ...}] — drives the canvas skeleton.
         "landmarks": data.get("landmarks", []),
         "left_angle": data.get("left_angle"),
         "right_angle": data.get("right_angle"),
-        # {ai_pct, dominant_side, risk} | null
         "asymmetry": data.get("asymmetry"),
-        # {phase, eccentric_s, isometric_s, concentric_s, eccentric_ok,
-        #  concentric_ok} | null
         "tempo": data.get("tempo"),
-        # [{code, message, muscle, severity}] — Phase 7 compensation signatures.
         "compensation_events": data.get("compensation_events", []),
     }
 
 
 def _load_signature(sess, user_id):
-    """Load this user's stored movement-signature baseline into the live session
-    (if one exists). Opens its own short-lived DB session — the WS connection is
-    long-lived, so we don't hold a request-scoped session open for it."""
     with SessionLocal() as db:
         row = db.scalar(
             select(MovementSignature).where(
@@ -768,7 +750,6 @@ async def websocket_endpoint(
     # user id comes from the verified token — never from a client-supplied field.
     ws_user_id = get_user_id_from_token(token)
     if ws_user_id is None:
-        # Closing before accept() rejects the handshake (HTTP 403).
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     with SessionLocal() as db:
@@ -784,7 +765,6 @@ async def websocket_endpoint(
                     websocket.receive_text(), timeout=HEARTBEAT_IDLE_SECONDS
                 )
             except asyncio.TimeoutError:
-                # Idle for 10s: ping and require a pong within 5s, else drop.
                 await websocket.send_text(json.dumps({"type": "ping"}))
                 try:
                     message = await asyncio.wait_for(
@@ -802,43 +782,29 @@ async def websocket_endpoint(
             except json.JSONDecodeError:
                 data = {}
 
-            # Heartbeat replies keep the connection alive; nothing to echo.
             if data.get("type") == "pong":
                 continue
 
             frame_b64 = data.get("frame")
             if frame_b64:
                 exercise = data.get("exercise", "squat")
-                # user_id is taken from the verified JWT, NOT the frame payload.
                 user_id = ws_user_id
-                # First frame for this session? (created lazily in process_frame)
                 first_frame = get_processing_session(session_id) is None
 
-                # Real webcam frame from the browser: run the pose pipeline off
-                # the event loop on the bounded FRAME_EXECUTOR (capped at 4
-                # workers) so many simultaneous sessions can't spawn unbounded
-                # MediaPipe threads.
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(
                     FRAME_EXECUTOR, process_frame, session_id, frame_b64,
                     exercise, user_id,
                 )
 
-                # --- signature persistence (the WS handler's DB-handle points) ---
                 sess = get_processing_session(session_id)
                 if sess is not None and user_id is not None:
-                    # On session start: load the user's existing baseline (if any)
-                    # right after the session is created on its first frame.
                     if first_frame:
                         _load_signature(sess, user_id)
-                    # When compute_baseline() just produced a fresh baseline,
-                    # persist it and clear the flag.
                     if sess.signature_needs_save:
                         _save_signature(sess, user_id)
                         sess.signature_needs_save = False
 
-                # Persist this frame's raw landmarks to the TimescaleDB
-                # hypertable (batched; flushes every FLUSH_EVERY_FRAMES frames).
                 await _persist_landmarks(
                     session_id, result.get("frame_id"),
                     result.get("landmarks", []),
@@ -846,9 +812,9 @@ async def websocket_endpoint(
 
                 await websocket.send_text(json.dumps(result))
             else:
-                # No image (e.g. the test client): echo a schema-shaped message.
                 await websocket.send_text(json.dumps(build_frame_message(data)))
     except WebSocketDisconnect:
         manager.disconnect(session_id)
         close_session(session_id)
         _close_landmarks(session_id)
+
