@@ -31,6 +31,12 @@ export async function login(email, password) {
   return me;
 }
 
+export const startSession = (exercise, target_sets = 3, reps_per_set = 10) =>
+  req("/sessions/start", {
+    method: "POST",
+    body: JSON.stringify({ exercise, target_sets, reps_per_set }),
+  });
+
 export const getSessions = () => req("/sessions?limit=100");
 export const getCommonErrors = (uid) => req(`/users/${uid}/common-errors`);
 export const getTempoHistory = (uid) => req(`/users/${uid}/tempo-history`);

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import AlertStack from "./components/AlertStack";
 import RepCounter from "./components/RepCounter";
-import { getToken } from "./api";
+import { getToken, startSession } from "./api";
 import { drawSkeleton } from "./skeleton";
 import "./WorkoutView.css";
 
@@ -23,7 +23,7 @@ export default function WorkoutView() {
   const manualCloseRef = useRef(false);
   const reconnectTimerRef = useRef(null);
 
-  const [sessionId, setSessionId] = useState("demo");
+  const [sessionId, setSessionId] = useState(null);
   const [exercise, setExercise] = useState("squat");
   const [connected, setConnected] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
@@ -126,7 +126,7 @@ export default function WorkoutView() {
     rafRef.current = requestAnimationFrame(loop);
   }
 
-  function connect() {
+  async function connect(existingSessionId = null) {
     if (wsRef.current) return;
     const token = getToken();
     if (!token) {
@@ -134,10 +134,24 @@ export default function WorkoutView() {
       return;
     }
     manualCloseRef.current = false;
-    // Token is sent as a query param — the backend rejects the handshake if it's
-    // missing/expired, so an unauthenticated user never opens a live stream.
+
+    // Create a real DB session (returns an integer id) unless we're reconnecting
+    // to an existing one. Using "demo" or any non-integer crashes the backend's
+    // landmark buffer (int("demo") → ValueError → WebSocket drop).
+    let sid = existingSessionId;
+    if (!sid) {
+      try {
+        const session = await startSession(exercise);
+        sid = session.session_id;
+        setSessionId(sid);
+      } catch (err) {
+        setToast(`Could not start session: ${err.message}`);
+        return;
+      }
+    }
+
     const ws = new WebSocket(
-      `${WS_HOST}/ws/${sessionId}?token=${encodeURIComponent(token)}`);
+      `${WS_HOST}/ws/${sid}?token=${encodeURIComponent(token)}`);
     ws.onopen = () => {
       setConnected(true);
       setReconnecting(false);
@@ -167,8 +181,9 @@ export default function WorkoutView() {
         return;
       }
       // Unexpected drop mid-session: show banner, auto-reconnect after 2s.
+      // Pass the existing session id so we don't create a new DB session.
       setReconnecting(true);
-      reconnectTimerRef.current = setTimeout(connect, 2000);
+      reconnectTimerRef.current = setTimeout(() => connect(sid), 2000);
     };
     wsRef.current = ws;
   }
@@ -197,8 +212,7 @@ export default function WorkoutView() {
       <header className="workout-header">
         <h1>KINESIS</h1>
         <div className="controls">
-          <input value={sessionId} onChange={(e) => setSessionId(e.target.value)}
-                 disabled={connected} placeholder="session id" />
+          {sessionId && <span className="session-label">Session #{sessionId}</span>}
           <select value={exercise} onChange={(e) => setExercise(e.target.value)}
                   disabled={connected}>
             <option value="squat">Squat</option>
@@ -210,7 +224,7 @@ export default function WorkoutView() {
           {connected ? (
             <button className="btn stop" onClick={disconnect}>Stop</button>
           ) : (
-            <button className="btn start" onClick={connect}>Start</button>
+            <button className="btn start" onClick={() => connect()}>Start</button>
           )}
           <span className={`dot ${connected ? "on" : "off"}`} />
         </div>
